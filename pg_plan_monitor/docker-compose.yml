@@ -1,0 +1,69 @@
+# Полный стек: ClickHouse + коллектор + веб.
+# Демо-PostgreSQL включён для быстрой пробы; для боевой БД удалите сервис
+# postgres и пропишите свой DSN в config.yaml.
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - ch-data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # Демонстрационный PostgreSQL с включённым pg_stat_statements.
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command: >
+      postgres
+      -c shared_preload_libraries=pg_stat_statements
+      -c pg_stat_statements.track=all
+      -c compute_query_id=on
+      -c track_io_timing=on
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./sql/pg_setup.sql:/docker-entrypoint-initdb.d/10_pgmon.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  collector:
+    build: .
+    command: python -m pgmon.collector.main
+    environment:
+      PGMON_CONFIG: /app/config.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    depends_on:
+      clickhouse: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  web:
+    build: .
+    environment:
+      PGMON_CONFIG: /app/config.yaml
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      clickhouse: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  ch-data:
+  pg-data:

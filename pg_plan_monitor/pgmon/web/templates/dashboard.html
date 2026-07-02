@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Дашборд</h1>
+<div class="filters">
+  <label>Период:</label>
+  <select id="hours">
+    <option value="1">1 час</option>
+    <option value="6" selected>6 часов</option>
+    <option value="24">Сутки</option>
+    <option value="168">Неделя</option>
+    <option value="720">Месяц</option>
+  </select>
+</div>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="grid-2">
+  <div class="card"><h3>Среднее время выполнения запросов</h3><div class="chart-box"><canvas id="ch-mean"></canvas></div></div>
+  <div class="card"><h3>Вызовы (calls)</h3><div class="chart-box"><canvas id="ch-calls"></canvas></div></div>
+  <div class="card"><h3>Сессии</h3><div class="chart-box"><canvas id="ch-sessions"></canvas></div></div>
+  <div class="card"><h3>Транзакции</h3><div class="chart-box"><canvas id="ch-tx"></canvas></div></div>
+  <div class="card"><h3>Чтение блоков: диск vs кэш</h3><div class="chart-box"><canvas id="ch-io"></canvas></div></div>
+  <div class="card"><h3>Время ожидания I/O (track_io_timing)</h3><div class="chart-box"><canvas id="ch-iotime"></canvas></div></div>
+</div>
+<div class="grid-2" id="host-cards" hidden>
+  <div class="card"><h3>CPU / память хоста, %</h3><div class="chart-box"><canvas id="ch-cpu"></canvas></div></div>
+  <div class="card"><h3>Диск хоста, байт за интервал</h3><div class="chart-box"><canvas id="ch-disk"></canvas></div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let charts = [];
+async function load() {
+  charts.forEach(c => c && c.destroy());
+  charts = [];
+  const hours = document.getElementById('hours').value;
+  const d = await getJSON(`/api/overview?hours=${hours}`);
+
+  const alerts = d.alerts_24h || {};
+  const nCrit = alerts.critical || 0, nWarn = alerts.warning || 0;
+  document.getElementById('tiles').innerHTML = `
+    <div class="tile"><div class="label">Запросов (уникальных)</div>
+      <div class="value">${fmtNum(d.totals.queries)}</div><div class="sub">за период</div></div>
+    <div class="tile"><div class="label">Всего вызовов</div>
+      <div class="value">${fmtNum(d.totals.calls)}</div><div class="sub">за период</div></div>
+    <div class="tile"><div class="label">Среднее время запроса</div>
+      <div class="value">${fmtMs(d.totals.mean_time)}</div><div class="sub">по всем запросам</div></div>
+    <div class="tile"><div class="label">Алерты за 24 ч</div>
+      <div class="value">${nCrit + nWarn}</div>
+      <div class="sub">${nCrit ? '⛔ ' + nCrit + ' критичных' : '✓ без критичных'}</div></div>`;
+
+  const s = d.series, st = d.statements;
+  charts.push(lineChart('ch-mean',
+    [{label: 'среднее время', data: toXY(st, 't', 'mean_time'), fill: true}], fmtMs));
+  charts.push(lineChart('ch-calls',
+    [{label: 'calls', data: toXY(st, 't', 'calls'), color: cssVar('--series-2'), fill: true}], fmtNum));
+  charts.push(lineChart('ch-sessions', [
+    {label: 'активные', data: toXY(s, 't', 'active')},
+    {label: 'idle in transaction', data: toXY(s, 't', 'idle_in_xact'), color: cssVar('--series-3')},
+    {label: 'ждут блокировку', data: toXY(s, 't', 'waiting'), color: cssVar('--series-6')},
+  ], fmtNum));
+  charts.push(lineChart('ch-tx', [
+    {label: 'commit', data: toXY(s, 't', 'commits'), color: cssVar('--series-2')},
+    {label: 'rollback', data: toXY(s, 't', 'rollbacks'), color: cssVar('--series-6')},
+  ], fmtNum));
+  charts.push(lineChart('ch-io', [
+    {label: 'с диска', data: toXY(s, 't', 'blks_read'), color: cssVar('--series-8')},
+    {label: 'из кэша', data: toXY(s, 't', 'blks_hit'), color: cssVar('--series-1')},
+  ], fmtNum));
+  charts.push(lineChart('ch-iotime', [
+    {label: 'чтение, мс', data: toXY(s, 't', 'blk_read_time')},
+    {label: 'запись, мс', data: toXY(s, 't', 'blk_write_time'), color: cssVar('--series-5')},
+  ], fmtNum));
+
+  if (d.host_metrics) {
+    document.getElementById('host-cards').hidden = false;
+    charts.push(lineChart('ch-cpu', [
+      {label: 'CPU %', data: toXY(s, 't', 'cpu')},
+      {label: 'RAM %', data: toXY(s, 't', 'mem'), color: cssVar('--series-5')},
+    ], v => v.toFixed(0) + '%'));
+    charts.push(lineChart('ch-disk', [
+      {label: 'чтение', data: toXY(s, 't', 'host_read_bytes'), color: cssVar('--series-8')},
+      {label: 'запись', data: toXY(s, 't', 'host_write_bytes'), color: cssVar('--series-5')},
+    ], fmtBytes));
+  }
+}
+document.getElementById('hours').addEventListener('change', load);
+load();
+setInterval(load, 60000);
+</script>
+{% endblock %}

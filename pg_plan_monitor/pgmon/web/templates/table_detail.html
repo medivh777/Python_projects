@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Таблица <span class="mono">{{ table }}</span> <span class="muted">({{ datname }})</span></h1>
+
+<div class="tiles" id="tiles"></div>
+
+<h2>Индексы</h2>
+<table class="data"><thead><tr>
+  <th>Индекс</th><th class="num">Использований за период</th><th class="num">Размер</th>
+  <th>Свойства</th><th>Определение</th>
+</tr></thead><tbody id="idx-tbody"></tbody></table>
+
+<h2>Запросы, работающие с таблицей</h2>
+<table class="data"><thead><tr>
+  <th>query_id</th><th>Запрос</th><th>Индексы в плане</th><th>Последний план</th>
+</tr></thead><tbody id="q-tbody"></tbody></table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const DAT = {{ datname | tojson }}, TBL = {{ table | tojson }};
+async function load() {
+  const d = await getJSON(`/api/table/${encodeURIComponent(DAT)}/${encodeURIComponent(TBL)}`);
+  const s = d.stats || {};
+  document.getElementById('tiles').innerHTML = `
+    <div class="tile"><div class="label">Размер (с индексами)</div><div class="value">${fmtBytes(s.total_bytes)}</div></div>
+    <div class="tile"><div class="label">Живых строк</div><div class="value">${fmtNum(s.n_live_tup)}</div></div>
+    <div class="tile"><div class="label">Мёртвых строк</div><div class="value">${fmtNum(s.n_dead_tup)}</div></div>
+    <div class="tile"><div class="label">Seq Scan (всего)</div><div class="value">${fmtNum(s.seq_scan)}</div></div>
+    <div class="tile"><div class="label">Index Scan (всего)</div><div class="value">${fmtNum(s.idx_scan)}</div></div>`;
+
+  document.getElementById('idx-tbody').innerHTML = (d.indexes || []).map(i => `
+    <tr><td class="mono">${esc(i.indexrelname)}</td>
+        <td class="num">${fmtNum(i.idx_scan_delta)}${Number(i.idx_scan_delta) === 0 ? ' <span class="sev warning">⚠ не используется</span>' : ''}</td>
+        <td class="num">${fmtBytes(i.size_bytes)}</td>
+        <td>${i.is_primary ? 'PK' : ''} ${i.is_unique ? 'UNIQUE' : ''}</td>
+        <td class="mono">${esc(i.definition)}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">нет данных</td></tr>';
+
+  document.getElementById('q-tbody').innerHTML = (d.queries || []).map(r => `
+    <tr><td><a href="/query/${r.queryid}" class="mono">${r.queryid}</a></td>
+        <td><div class="sql">${esc(r.query)}</div></td>
+        <td>${(r.indexes || []).join(', ') || '—'}</td>
+        <td>${fmtTs(String(r.last_plan))}</td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted">нет данных</td></tr>';
+}
+load();
+</script>
+{% endblock %}

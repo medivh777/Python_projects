@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Активность</h1>
+<div class="filters">
+  <label>Период:</label>
+  <select id="hours">
+    <option value="1" selected>1 час</option>
+    <option value="6">6 часов</option>
+    <option value="24">Сутки</option>
+    <option value="168">Неделя</option>
+  </select>
+  <span class="muted">данные из ClickHouse (семплы ASH), автообновление 15 с</span>
+</div>
+
+<div class="card">
+  <h3>Средние активные сессии по типу ожидания (ASH)</h3>
+  <div class="chart-box" style="height:280px"><canvas id="ch-ash"></canvas></div>
+</div>
+
+<div class="grid-2">
+  <div class="card">
+    <h3>Топ ожиданий за период</h3>
+    <table class="data"><thead><tr><th>Ожидание</th><th class="num">Семплов</th></tr></thead>
+      <tbody id="waits-tbody"></tbody></table>
+  </div>
+  <div class="card">
+    <h3>Топ запросов по активности (семплам)</h3>
+    <table class="data"><thead><tr><th>query_id</th><th>Запрос</th><th class="num">Семплов</th></tr></thead>
+      <tbody id="topq-tbody"></tbody></table>
+  </div>
+</div>
+
+<h2>Сессии в последнем семпле <span class="muted" id="sample-ts"></span></h2>
+<table class="data">
+  <thead><tr><th>PID</th><th>БД</th><th>Пользователь</th><th>Приложение</th>
+    <th>Состояние</th><th>Ожидание</th><th>Блокирован</th><th>Запрос</th></tr></thead>
+  <tbody id="cur-tbody"></tbody>
+</table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let ashChart = null;
+
+async function load() {
+  const hours = document.getElementById('hours').value;
+  const d = await getJSON(`/api/activity?hours=${hours}`);
+
+  // серия -> {waitType: {t: sessions}}
+  const byType = {}, tsSet = new Set();
+  d.wait_series.forEach(r => {
+    byType[r.wait_type] = byType[r.wait_type] || {};
+    byType[r.wait_type][r.t] = Number(r.sessions);
+    tsSet.add(r.t);
+  });
+  const labels = [...tsSet].sort();
+  const types = Object.keys(byType).sort();
+  const datasets = types.map((wt, i) => ({
+    label: wt,
+    data: labels.map(t => byType[wt][t] || 0),
+    backgroundColor: waitColor(wt, i),
+  }));
+  if (ashChart) ashChart.destroy();
+  ashChart = stackedBarChart('ch-ash', labels.map(isoUTC), datasets,
+    v => Number(v).toFixed(1));
+
+  document.getElementById('waits-tbody').innerHTML = d.top_waits.map(w =>
+    `<tr><td>${esc(w.wait)}</td><td class="num">${fmtNum(w.samples)}</td></tr>`).join('')
+    || '<tr><td colspan="2" class="muted">нет данных</td></tr>';
+
+  document.getElementById('topq-tbody').innerHTML = d.top_queries.map(r => `
+    <tr><td>${r.queryid ? `<a href="/query/${r.queryid}" class="mono">${r.queryid}</a>` : '—'}</td>
+        <td><div class="sql">${esc(r.query)}</div></td>
+        <td class="num">${fmtNum(r.samples)}</td></tr>`).join('')
+    || '<tr><td colspan="3" class="muted">нет данных</td></tr>';
+
+  document.getElementById('sample-ts').textContent =
+    d.current.length ? '· ' + fmtTs(String(d.current[0].ts)) : '';
+  document.getElementById('cur-tbody').innerHTML = d.current.map(a => `
+    <tr>
+      <td class="mono">${a.pid}</td>
+      <td>${esc(a.datname)}</td>
+      <td>${esc(a.usename)}</td>
+      <td>${esc(a.application_name)}</td>
+      <td>${esc(a.state)}</td>
+      <td>${a.wait_event ? esc(a.wait_event_type + ':' + a.wait_event) : '<span class="muted">CPU</span>'}</td>
+      <td>${(a.blocked_by || []).length ? '<span class="sev critical">⛔ pid ' + a.blocked_by.join(', ') + '</span>' : '—'}</td>
+      <td><div class="sql">${esc(a.query)}</div></td>
+    </tr>`).join('') || '<tr><td colspan="8" class="muted">нет активных сессий</td></tr>';
+}
+document.getElementById('hours').addEventListener('change', load);
+load();
+setInterval(load, 15000);
+</script>
+{% endblock %}

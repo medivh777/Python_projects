@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Рекомендации по индексам</h1>
+<p class="muted">
+  Формируются автоматически: «создать» — по Seq Scan с фильтрами в планах запросов;
+  «удалить» — по индексам без использования за весь период наблюдения;
+  «дубликат» — по индексам-префиксам. Перед применением DDL проверьте его на тестовом стенде.
+</p>
+
+<h2>Создать индекс</h2>
+<table class="data"><thead><tr>
+  <th>БД</th><th>Таблица</th><th>Колонки</th><th>Почему</th><th>Запросы</th><th>DDL</th>
+</tr></thead><tbody id="create-tbody"></tbody></table>
+
+<h2>Удалить неиспользуемый индекс</h2>
+<table class="data"><thead><tr>
+  <th>БД</th><th>Таблица</th><th>Индекс</th><th>Почему</th><th>DDL</th>
+</tr></thead><tbody id="drop-tbody"></tbody></table>
+
+<h2>Избыточные (дублирующие) индексы</h2>
+<table class="data"><thead><tr>
+  <th>БД</th><th>Таблица</th><th>Индекс</th><th>Почему</th><th>DDL</th>
+</tr></thead><tbody id="dup-tbody"></tbody></table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function ddlCell(ddl) {
+  return `<span class="ddl">${esc(ddl)}</span>
+    <button class="copy" onclick="copyText(${JSON.stringify(ddl).replace(/"/g, '&quot;')}, this)">копировать</button>`;
+}
+async function load() {
+  const rows = await getJSON('/api/recommendations');
+  const empty = cols => `<tr><td colspan="${cols}" class="muted">рекомендаций нет</td></tr>`;
+
+  const create = rows.filter(r => r.kind === 'create_index');
+  document.getElementById('create-tbody').innerHTML = create.map(r => `
+    <tr><td>${esc(r.datname)}</td>
+        <td><a href="/table/${encodeURIComponent(r.datname)}/${encodeURIComponent(r.tablename)}">${esc(r.tablename)}</a></td>
+        <td class="mono">${(r.columns || []).join(', ')}</td>
+        <td>${esc(r.reason)}</td>
+        <td>${(r.queryids || []).map(q => `<a href="/query/${q}" class="mono">${q}</a>`).join(', ')}</td>
+        <td>${ddlCell(r.ddl)}</td></tr>`).join('') || empty(6);
+
+  const drop = rows.filter(r => r.kind === 'drop_index');
+  document.getElementById('drop-tbody').innerHTML = drop.map(r => `
+    <tr><td>${esc(r.datname)}</td><td>${esc(r.tablename)}</td>
+        <td class="mono">${esc(r.indexname)}</td>
+        <td>${esc(r.reason)}</td><td>${ddlCell(r.ddl)}</td></tr>`).join('') || empty(5);
+
+  const dup = rows.filter(r => r.kind === 'duplicate_index');
+  document.getElementById('dup-tbody').innerHTML = dup.map(r => `
+    <tr><td>${esc(r.datname)}</td><td>${esc(r.tablename)}</td>
+        <td class="mono">${esc(r.indexname)}</td>
+        <td>${esc(r.reason)}</td><td>${ddlCell(r.ddl)}</td></tr>`).join('') || empty(5);
+}
+load();
+</script>
+{% endblock %}

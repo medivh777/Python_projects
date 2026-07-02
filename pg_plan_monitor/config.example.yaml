@@ -1,0 +1,61 @@
+# Конфигурация pg_plan_monitor.
+# Скопируйте в config.yaml и поправьте под своё окружение.
+# Любое значение можно переопределить переменной окружения PGMON_<SECTION>_<KEY>,
+# например PGMON_CLICKHOUSE_HOST=ch1.local
+
+clusters:
+  # Можно мониторить несколько кластеров PostgreSQL одновременно.
+  - name: main
+    # DSN учётки мониторинга (см. sql/pg_setup.sql — роль pg_monitor + pg_stat_statements)
+    dsn: postgresql://pgmon:pgmon@postgres:5432/postgres
+    # Список БД, в которых снимать планы/статистику таблиц.
+    # Пустой список = автообнаружение всех не-шаблонных БД.
+    databases: []
+
+clickhouse:
+  host: clickhouse
+  port: 8123           # HTTP-порт
+  user: default
+  password: ""
+  database: pgmon
+  secure: false
+
+# Интервалы опроса, секунды. Подобраны так, чтобы не грузить PostgreSQL:
+# тяжёлые выборки (планы, статистика таблиц) выполняются редко,
+# лёгкие (pg_stat_activity) — часто, но это чтение из памяти.
+intervals:
+  ash_sample: 2        # семплирование активных сессий (active session history)
+  statements: 60       # снапшот pg_stat_statements (дельты)
+  locks: 10            # дерево блокировок (пишется только когда есть блокировки)
+  sysstat: 15          # pg_stat_database / bgwriter (+ psutil, если включён)
+  plans: 300           # снятие планов топ-N запросов через EXPLAIN
+  table_stats: 600     # pg_stat_user_tables / indexes + размеры
+  recommend: 1800      # пересчёт рекомендаций по индексам
+
+plans:
+  top_n: 50                  # сколько «тяжёлых» запросов планировать за проход
+  min_calls: 5               # не планировать разовые запросы
+  statement_timeout_ms: 3000 # защита: EXPLAIN не должен висеть
+  # EXPLAIN (GENERIC_PLAN) для параметризованных запросов ($1, $2 …), нужен PG >= 16.
+  # На старых версиях параметризованные запросы пропускаются.
+  use_generic_plan: true
+
+# Сроки хранения в ClickHouse (TTL партиций), в днях.
+retention:
+  ash_days: 14
+  locks_days: 7        # история блокировок — неделя, по ТЗ
+  metrics_days: 90
+  plans_days: 90
+
+alerts:
+  # Рост total_cost плана более чем в N раз => warning даже без смены структуры
+  cost_ratio_warning: 5.0
+
+# Снимать CPU/RAM/диск хоста через psutil. Включайте, только если коллектор
+# запущен на том же хосте, что и PostgreSQL. Иначе нагрузка оценивается
+# по данным самого PostgreSQL (active backends, blk_read_time и т.п.).
+host_metrics: false
+
+web:
+  listen: 0.0.0.0
+  port: 8080

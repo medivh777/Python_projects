@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+jinja2>=3.1
+psycopg[binary]>=3.1
+clickhouse-connect>=0.7
+PyYAML>=6.0
+psutil>=5.9
+pytest>=8.0

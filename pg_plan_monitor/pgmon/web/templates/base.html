@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} — pg_plan_monitor</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>📊</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- локальные копии, чтобы работало без доступа в интернет -->
+  <script src="/static/chart.umd.min.js"></script>
+  <script src="/static/chartjs-adapter-date-fns.bundle.min.js"></script>
+</head>
+<body>
+<nav class="topnav">
+  <span class="brand">pg_plan_monitor</span>
+  <a href="/" class="{{ 'active' if path == '/' }}">Дашборд</a>
+  <a href="/queries" class="{{ 'active' if path.startswith('/quer') }}">Запросы</a>
+  <a href="/activity" class="{{ 'active' if path == '/activity' }}">Активность</a>
+  <a href="/locks" class="{{ 'active' if path == '/locks' }}">Блокировки</a>
+  <a href="/alerts" class="{{ 'active' if path == '/alerts' }}">Алерты <span id="alert-badge" class="badge" hidden></span></a>
+  <a href="/recommendations" class="{{ 'active' if path == '/recommendations' }}">Рекомендации</a>
+</nav>
+<main class="viz-root">
+  {% block content %}{% endblock %}
+</main>
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Запросы</h1>
+<div class="filters">
+  <label>Период:</label>
+  <select id="hours">
+    <option value="1">1 час</option>
+    <option value="6">6 часов</option>
+    <option value="24" selected>Сутки</option>
+    <option value="168">Неделя</option>
+  </select>
+  <label>Сортировка:</label>
+  <select id="order">
+    <option value="total_time" selected>по суммарному времени</option>
+    <option value="mean_time">по среднему времени</option>
+    <option value="calls">по вызовам</option>
+    <option value="max_time">по максимальному времени</option>
+    <option value="blks_read">по чтению с диска</option>
+  </select>
+  <input type="text" id="search" placeholder="поиск по тексту запроса…" size="40">
+</div>
+<table class="data" id="tbl">
+  <thead><tr>
+    <th>query_id</th><th>Запрос</th><th>БД</th>
+    <th class="num">Вызовы</th><th class="num">Среднее</th>
+    <th class="num">Максимум</th><th class="num">Суммарно</th>
+    <th class="num">Диск, блоков</th><th class="num">Планов</th>
+  </tr></thead>
+  <tbody></tbody>
+</table>
+<div class="empty" id="empty" hidden>Нет данных за выбранный период</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+async function load() {
+  const hours = document.getElementById('hours').value;
+  const order = document.getElementById('order').value;
+  const search = encodeURIComponent(document.getElementById('search').value);
+  const rows = await getJSON(`/api/queries?hours=${hours}&order=${order}&search=${search}`);
+  const tb = document.querySelector('#tbl tbody');
+  document.getElementById('empty').hidden = rows.length > 0;
+  tb.innerHTML = rows.map(r => `
+    <tr>
+      <td><a href="/query/${r.queryid}" class="mono">${r.queryid}</a></td>
+      <td><div class="sql">${esc(r.query)}</div></td>
+      <td>${esc(r.datname)}</td>
+      <td class="num">${fmtNum(r.calls)}</td>
+      <td class="num">${fmtMs(r.mean_time)}</td>
+      <td class="num">${fmtMs(r.max_time)}</td>
+      <td class="num">${fmtMs(r.total_time)}</td>
+      <td class="num">${fmtNum(r.blks_read)}</td>
+      <td class="num">${r.plan_count || '—'}</td>
+    </tr>`).join('');
+}
+['hours', 'order'].forEach(id => document.getElementById(id).addEventListener('change', load));
+let t; document.getElementById('search').addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 400); });
+load();
+</script>
+{% endblock %}

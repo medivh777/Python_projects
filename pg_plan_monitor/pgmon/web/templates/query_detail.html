@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Запрос <span class="mono">{{ queryid }}</span></h1>
+<div class="filters">
+  <label>Период:</label>
+  <select id="hours">
+    <option value="6">6 часов</option>
+    <option value="24" selected>Сутки</option>
+    <option value="168">Неделя</option>
+    <option value="720">Месяц</option>
+  </select>
+  <span class="muted" id="meta"></span>
+</div>
+
+<div class="card"><h3>Текст запроса</h3><div class="sql full mono" id="sqltext"></div></div>
+
+<div class="tiles" id="tiles"></div>
+
+<div class="grid-2">
+  <div class="card"><h3>Среднее время выполнения</h3><div class="chart-box"><canvas id="ch-mean"></canvas></div></div>
+  <div class="card"><h3>Вызовы</h3><div class="chart-box"><canvas id="ch-calls"></canvas></div></div>
+  <div class="card"><h3>Блоки: диск vs кэш</h3><div class="chart-box"><canvas id="ch-io"></canvas></div></div>
+  <div class="card"><h3>Temp-блоки и WAL</h3><div class="chart-box"><canvas id="ch-temp"></canvas></div></div>
+</div>
+
+<h2>Алерты по смене плана</h2>
+<div id="alerts"></div>
+
+<h2>История планов</h2>
+<div class="muted">План сохраняется только при изменении структуры. Отметьте два плана, чтобы сравнить.</div>
+<table class="data" id="plans-tbl">
+  <thead><tr><th></th><th>Когда</th><th>Fingerprint</th><th class="num">Стоимость</th>
+    <th>Таблицы</th><th>Индексы</th><th>Seq Scan</th><th>Источник</th></tr></thead>
+  <tbody></tbody>
+</table>
+<p><button class="copy" id="diff-btn">Сравнить выбранные планы</button></p>
+<div id="diff-result"></div>
+
+<h2>Текущий план</h2>
+<pre class="plan" id="plan-text">—</pre>
+
+<h2>Таблицы и индексы запроса</h2>
+<div id="tables-info" class="card"></div>
+
+<h2>Запросы по тем же таблицам</h2>
+<table class="data" id="related-tbl">
+  <thead><tr><th>query_id</th><th>Запрос</th></tr></thead><tbody></tbody>
+</table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// queryid — Int64, в JS держим строкой, чтобы не потерять точность
+const QID = "{{ queryid }}";
+let charts = [];
+
+async function load() {
+  charts.forEach(c => c && c.destroy());
+  charts = [];
+  const hours = document.getElementById('hours').value;
+  const d = await getJSON(`/api/query/${QID}?hours=${hours}`);
+
+  document.getElementById('sqltext').textContent = d.meta.query;
+  document.getElementById('meta').textContent =
+    `БД: ${d.meta.datname} · пользователь: ${d.meta.usename} · последний раз: ${fmtTs(String(d.meta.last_seen))}`;
+
+  document.getElementById('tiles').innerHTML = `
+    <div class="tile"><div class="label">Вызовы</div><div class="value">${fmtNum(d.totals.calls)}</div></div>
+    <div class="tile"><div class="label">Среднее время</div><div class="value">${fmtMs(d.totals.mean_time)}</div></div>
+    <div class="tile"><div class="label">Максимум</div><div class="value">${fmtMs(d.totals.max_time)}</div></div>
+    <div class="tile"><div class="label">Суммарное время</div><div class="value">${fmtMs(d.totals.total_time)}</div></div>
+    <div class="tile"><div class="label">Кэш-хит</div><div class="value">${
+      d.totals.blks_hit + d.totals.blks_read > 0
+        ? (100 * d.totals.blks_hit / (d.totals.blks_hit + d.totals.blks_read)).toFixed(1) + '%' : '—'
+    }</div></div>`;
+
+  const s = d.series;
+  charts.push(lineChart('ch-mean', [
+    {label: 'среднее', data: toXY(s, 't', 'mean_time'), fill: true},
+    {label: 'максимум', data: toXY(s, 't', 'max_time'), color: cssVar('--series-6')},
+  ], fmtMs));
+  charts.push(lineChart('ch-calls',
+    [{label: 'calls', data: toXY(s, 't', 'calls'), color: cssVar('--series-2'), fill: true}], fmtNum));
+  charts.push(lineChart('ch-io', [
+    {label: 'с диска', data: toXY(s, 't', 'blks_read'), color: cssVar('--series-8')},
+    {label: 'из кэша', data: toXY(s, 't', 'blks_hit'), color: cssVar('--series-1')},
+  ], fmtNum));
+  charts.push(lineChart('ch-temp', [
+    {label: 'temp-блоков записано', data: toXY(s, 't', 'temp_blks_written'), color: cssVar('--series-3')},
+    {label: 'WAL, байт', data: toXY(s, 't', 'wal_bytes'), color: cssVar('--series-5')},
+  ], fmtNum));
+
+  // алерты
+  document.getElementById('alerts').innerHTML = d.alerts.length
+    ? `<table class="data"><thead><tr><th>Когда</th><th>Уровень</th><th>Тип</th><th>Описание</th></tr></thead><tbody>` +
+      d.alerts.map(a => `<tr>
+        <td>${fmtTs(String(a.ts))}</td>
+        <td><span class="sev ${a.severity}">${a.severity === 'critical' ? '⛔' : a.severity === 'warning' ? '⚠' : 'ℹ'} ${a.severity}</span></td>
+        <td><span class="kind-tag">${esc(a.kind)}</span></td>
+        <td>${esc(a.description)}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="muted">Смен плана не зафиксировано</div>';
+
+  // планы
+  document.querySelector('#plans-tbl tbody').innerHTML = d.plans.map(p => `
+    <tr>
+      <td><input type="checkbox" class="plan-cb" value="${p.fingerprint}"></td>
+      <td>${fmtTs(String(p.ts))}</td>
+      <td class="mono">${p.fingerprint}</td>
+      <td class="num">${Number(p.total_cost).toFixed(0)}</td>
+      <td>${(p.tables || []).map(t => `<a href="/table/${encodeURIComponent(d.meta.datname)}/${encodeURIComponent(t)}">${esc(t)}</a>`).join(', ')}</td>
+      <td>${(p.indexes || []).join(', ') || '—'}</td>
+      <td>${(p.seq_scan_tables || []).length ? '<span class="sev critical">⛔ ' + p.seq_scan_tables.join(', ') + '</span>' : '—'}</td>
+      <td>${esc(p.source)}</td>
+    </tr>`).join('') || '<tr><td colspan="8" class="muted">планы ещё не сняты</td></tr>';
+
+  if (d.plans.length) {
+    const latest = await getJSON(`/api/query/${QID}/plan/${d.plans[0].fingerprint}`);
+    document.getElementById('plan-text').innerHTML = renderPlanText(latest.plan);
+  }
+
+  document.getElementById('tables-info').innerHTML = `
+    <p><b>Таблицы:</b> ${(d.tables || []).map(t =>
+      `<a href="/table/${encodeURIComponent(d.meta.datname)}/${encodeURIComponent(t)}">${esc(t)}</a>`).join(', ') || '—'}</p>
+    <p><b>Используемые индексы:</b> ${(d.indexes || []).join(', ') || '—'}</p>`;
+
+  document.querySelector('#related-tbl tbody').innerHTML = (d.related || []).map(r => `
+    <tr><td><a href="/query/${r.queryid}" class="mono">${r.queryid}</a></td>
+        <td><div class="sql">${esc(r.query)}</div></td></tr>`).join('')
+    || '<tr><td colspan="2" class="muted">нет данных</td></tr>';
+}
+
+document.getElementById('diff-btn').addEventListener('click', async () => {
+  const checked = [...document.querySelectorAll('.plan-cb:checked')].map(cb => cb.value);
+  const box = document.getElementById('diff-result');
+  if (checked.length !== 2) { box.innerHTML = '<div class="muted">Отметьте ровно два плана</div>'; return; }
+  const d = await getJSON(`/api/query/${QID}/diff?old=${checked[1]}&new=${checked[0]}`);
+  box.innerHTML = `
+    <div class="card">
+      <h3>Изменения (${d.old.fingerprint} → ${d.new.fingerprint})</h3>
+      ${d.changes.map(c => `<p><span class="sev ${c.severity}">${c.severity}</span>
+         <span class="kind-tag">${esc(c.kind)}</span> ${esc(c.description)}</p>`).join('')
+        || '<p class="muted">структурных изменений нет</p>'}
+    </div>
+    <div class="grid-2">
+      <div><h3 class="muted">Старый план (cost=${d.old.cost.toFixed(0)})</h3><pre class="plan">${renderPlanText(d.old.plan)}</pre></div>
+      <div><h3 class="muted">Новый план (cost=${d.new.cost.toFixed(0)})</h3><pre class="plan">${renderPlanText(d.new.plan)}</pre></div>
+    </div>`;
+});
+
+document.getElementById('hours').addEventListener('change', load);
+load();
+</script>
+{% endblock %}

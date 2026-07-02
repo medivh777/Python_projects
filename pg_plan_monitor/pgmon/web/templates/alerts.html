@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Алерты: смена планов запросов</h1>
+<div class="filters">
+  <label>Период:</label>
+  <select id="days">
+    <option value="1">сутки</option>
+    <option value="7" selected>неделя</option>
+    <option value="30">месяц</option>
+    <option value="90">3 месяца</option>
+  </select>
+  <label>Уровень:</label>
+  <select id="severity">
+    <option value="" selected>все</option>
+    <option value="critical">critical</option>
+    <option value="warning">warning</option>
+    <option value="info">info</option>
+  </select>
+</div>
+
+<table class="data">
+  <thead><tr>
+    <th>Когда</th><th>Уровень</th><th>Тип</th><th>query_id</th><th>БД</th>
+    <th>Описание</th><th>Запрос</th><th class="num">Cost</th><th></th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+<div class="empty" id="empty" hidden>Алертов за период нет — планы стабильны ✓</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const ICONS = { critical: '⛔', warning: '⚠', info: 'ℹ' };
+async function load() {
+  const days = document.getElementById('days').value;
+  const sev = document.getElementById('severity').value;
+  const rows = await getJSON(`/api/alerts?days=${days}&severity=${sev}`);
+  document.getElementById('empty').hidden = rows.length > 0;
+  document.getElementById('tbody').innerHTML = rows.map(a => `
+    <tr>
+      <td>${fmtTs(String(a.ts))}</td>
+      <td><span class="sev ${a.severity}">${ICONS[a.severity] || ''} ${a.severity}</span></td>
+      <td><span class="kind-tag">${esc(a.kind)}</span></td>
+      <td><a href="/query/${a.queryid}" class="mono">${a.queryid}</a></td>
+      <td>${esc(a.datname)}</td>
+      <td>${esc(a.description)}</td>
+      <td><div class="sql">${esc(a.query)}</div></td>
+      <td class="num">${Number(a.old_cost).toFixed(0)} → ${Number(a.new_cost).toFixed(0)}</td>
+      <td><a href="/query/${a.queryid}">детали →</a></td>
+    </tr>`).join('');
+}
+['days', 'severity'].forEach(id => document.getElementById(id).addEventListener('change', load));
+load();
+setInterval(load, 60000);
+</script>
+{% endblock %}

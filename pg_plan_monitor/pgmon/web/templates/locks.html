@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Блокировки</h1>
+<div class="filters">
+  <label>История за:</label>
+  <select id="days">
+    <option value="1">сутки</option>
+    <option value="3">3 дня</option>
+    <option value="7" selected>неделю</option>
+  </select>
+  <span class="muted">история хранится 7 дней, автообновление 15 с</span>
+</div>
+
+<h2>Сейчас</h2>
+<div id="current"></div>
+
+<div class="card">
+  <h3>Заблокированные сессии по времени</h3>
+  <div class="chart-box"><canvas id="ch-locks"></canvas></div>
+</div>
+
+<h2>История: кто кого блокировал</h2>
+<table class="data">
+  <thead><tr>
+    <th>Когда</th><th>БД</th><th>Объект</th><th>Тип лока</th>
+    <th>Жертва (pid)</th><th>Запрос жертвы</th><th class="num">Ждёт, с</th>
+    <th>Блокирующий (pid)</th><th>Запрос блокирующего</th><th>Состояние</th>
+  </tr></thead>
+  <tbody id="hist-tbody"></tbody>
+</table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let chart = null;
+function lockRow(l) {
+  return `<tr>
+    <td>${fmtTs(String(l.ts))}</td>
+    <td>${esc(l.datname)}</td>
+    <td class="mono">${esc(l.relation) || '—'}</td>
+    <td>${esc(l.lock_type)} ${l.blocked_mode ? '<span class="muted">(' + esc(l.blocked_mode) + ')</span>' : ''}</td>
+    <td class="mono">${l.blocked_pid} <span class="muted">${esc(l.blocked_user)}</span></td>
+    <td><div class="sql">${esc(l.blocked_query)}</div></td>
+    <td class="num">${Number(l.blocked_duration_s).toFixed(1)}</td>
+    <td class="mono">${l.blocking_pid} <span class="muted">${esc(l.blocking_user)}</span></td>
+    <td><div class="sql">${esc(l.blocking_query)}</div></td>
+    <td>${esc(l.blocking_state)}</td>
+  </tr>`;
+}
+
+async function load() {
+  const days = document.getElementById('days').value;
+  const d = await getJSON(`/api/locks?days=${days}`);
+
+  document.getElementById('current').innerHTML = d.current.length
+    ? `<table class="data"><thead><tr>
+         <th>Объект</th><th>Жертва</th><th>Запрос жертвы</th><th class="num">Ждёт, с</th>
+         <th>Блокирующий</th><th>Запрос блокирующего</th></tr></thead><tbody>` +
+      d.current.map(l => `<tr>
+        <td class="mono">${esc(l.relation) || esc(l.lock_type)}</td>
+        <td class="mono">⛔ ${l.blocked_pid} <span class="muted">${esc(l.blocked_user)}</span></td>
+        <td><div class="sql">${esc(l.blocked_query)}</div></td>
+        <td class="num">${Number(l.blocked_duration_s).toFixed(1)}</td>
+        <td class="mono">${l.blocking_pid} <span class="muted">${esc(l.blocking_user)} · ${esc(l.blocking_state)}</span></td>
+        <td><div class="sql">${esc(l.blocking_query)}</div></td></tr>`).join('') +
+      '</tbody></table>'
+    : '<div class="card"><span class="muted">✓ активных блокировок нет</span></div>';
+
+  if (chart) chart.destroy();
+  chart = lineChart('ch-locks',
+    [{label: 'заблокированные сессии', data: toXY(d.series, 't', 'blocked_sessions'),
+      color: cssVar('--series-6'), fill: true}], fmtNum);
+
+  document.getElementById('hist-tbody').innerHTML =
+    d.history.map(lockRow).join('') ||
+    '<tr><td colspan="10" class="muted">блокировок за период не было</td></tr>';
+}
+document.getElementById('days').addEventListener('change', load);
+load();
+setInterval(load, 15000);
+</script>
+{% endblock %}
