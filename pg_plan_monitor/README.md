@@ -76,6 +76,33 @@ DSN в `config.yaml`.
 Требования: **PostgreSQL 13+** (для планов параметризованных запросов через
 `EXPLAIN (GENERIC_PLAN)` — **PostgreSQL 16+**), ClickHouse 23+.
 
+## Мониторинг нескольких серверов PostgreSQL
+
+Каждый сервер (кластер) — отдельный элемент списка `clusters` в `config.yaml`:
+
+```yaml
+clusters:
+  - name: main
+    dsn: postgresql://pgmon:secret@db1.internal:5432/postgres
+    databases: []                      # все БД кластера
+  - name: replica-analytics
+    dsn: postgresql://pgmon:secret@10.0.0.12:5432/postgres
+    databases: [analytics, reports]    # только выбранные БД
+  - name: billing
+    dsn: postgresql://pgmon:secret@billing-db.internal:5433/postgres
+    databases: []
+```
+
+Для каждого кластера коллектор поднимает собственный набор потоков
+(ASH, statements, планы, блокировки и т.д.), данные пишутся в общий
+ClickHouse с колонкой `cluster`. Когда кластеров больше одного, в шапке
+сайта появляется переключатель — все страницы и API фильтруются по
+выбранному кластеру (`?cluster=<имя>`).
+
+На каждом наблюдаемом сервере нужно выполнить `sql/pg_setup.sql`
+и включить `pg_stat_statements` (см. выше). После изменения списка
+кластеров перезапустите коллектор.
+
 ## Запуск без Docker
 
 ```bash

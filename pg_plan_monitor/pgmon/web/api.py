@@ -1,4 +1,9 @@
-"""JSON API. Все данные читаются из ClickHouse — PostgreSQL не нагружается."""
+"""JSON API. Все данные читаются из ClickHouse — PostgreSQL не нагружается.
+
+Каждый эндпоинт принимает необязательный параметр ?cluster=<имя> —
+фильтр по кластеру PostgreSQL (см. секцию clusters конфига).
+Без параметра возвращаются данные всех кластеров.
+"""
 
 from __future__ import annotations
 
@@ -40,6 +45,14 @@ def str_qids(rows: list[dict]) -> list[dict]:
     return rows
 
 
+def cluster_cond(cluster: str, params: dict, col: str = "cluster") -> str:
+    """'AND <col> = %(cluster)s', если фильтр по кластеру задан."""
+    if cluster:
+        params["cluster"] = cluster
+        return f"AND {col} = %(cluster)s"
+    return ""
+
+
 def bucket_minutes(hours: int) -> int:
     if hours <= 6:
         return 5
@@ -52,13 +65,22 @@ def bucket_minutes(hours: int) -> int:
     return 360
 
 
+@router.get("/clusters")
+def clusters_list() -> list[str]:
+    """Имена кластеров из конфигурации — для селектора в шапке."""
+    return [c["name"] for c in cfg().clusters]
+
+
 # ---------------------------------------------------------------------------
-# Обзор / графики statements (как в temboard)
+# Обзор
 # ---------------------------------------------------------------------------
 
 @router.get("/overview")
-def overview(hours: int = Query(6, ge=1, le=720)) -> dict:
+def overview(hours: int = Query(6, ge=1, le=720), cluster: str = "") -> dict:
     step = bucket_minutes(hours)
+    params: dict[str, Any] = {"hours": hours}
+    cc = cluster_cond(cluster, params)
+
     series = q(f"""
         SELECT toStartOfInterval(ts, INTERVAL {step} MINUTE) AS t,
                avg(active_backends)   AS active,
@@ -76,9 +98,9 @@ def overview(hours: int = Query(6, ge=1, le=720)) -> dict:
                sum(host_read_bytes)   AS host_read_bytes,
                sum(host_write_bytes)  AS host_write_bytes
         FROM sysstat
-        WHERE ts > now() - INTERVAL %(hours)s HOUR
+        WHERE ts > now() - INTERVAL %(hours)s HOUR {cc}
         GROUP BY t ORDER BY t
-    """, {"hours": hours})
+    """, params)
 
     stmt = q(f"""
         SELECT toStartOfInterval(ts, INTERVAL {step} MINUTE) AS t,
@@ -86,25 +108,27 @@ def overview(hours: int = Query(6, ge=1, le=720)) -> dict:
                sum(total_exec_time)           AS total_time,
                total_time / greatest(calls,1) AS mean_time
         FROM statements_metrics
-        WHERE ts > now() - INTERVAL %(hours)s HOUR
+        WHERE ts > now() - INTERVAL %(hours)s HOUR {cc}
         GROUP BY t ORDER BY t
-    """, {"hours": hours})
+    """, params)
 
-    totals = q("""
+    totals = q(f"""
         SELECT count(DISTINCT queryid)        AS queries,
                sum(calls)                     AS calls,
                sum(total_exec_time)           AS total_time,
                total_time / greatest(calls,1) AS mean_time
         FROM statements_metrics
-        WHERE ts > now() - INTERVAL %(hours)s HOUR
-    """, {"hours": hours})
+        WHERE ts > now() - INTERVAL %(hours)s HOUR {cc}
+    """, params)
 
-    alerts = q("""
+    aparams: dict[str, Any] = {}
+    acc = cluster_cond(cluster, aparams)
+    alerts = q(f"""
         SELECT severity, count() AS cnt
         FROM plan_alerts
-        WHERE ts > now() - INTERVAL 24 HOUR
+        WHERE ts > now() - INTERVAL 24 HOUR {acc}
         GROUP BY severity
-    """)
+    """, aparams)
 
     host_metrics = bool(cfg().get("host_metrics", default=False))
     return {
@@ -123,16 +147,21 @@ def overview(hours: int = Query(6, ge=1, le=720)) -> dict:
 def queries(hours: int = Query(24, ge=1, le=720),
             search: str = "",
             order: str = Query("total_time", pattern="^(total_time|calls|mean_time|max_time|blks_read)$"),
-            limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
+            limit: int = Query(100, ge=1, le=1000),
+            cluster: str = "") -> list[dict]:
+    params: dict[str, Any] = {"hours": hours, "limit": limit}
+    cc = cluster_cond(cluster, params, "m.cluster")
+
     # серверный поиск по телу запроса: сначала находим подходящие queryid
     search_filter = ""
-    params: dict[str, Any] = {"hours": hours, "limit": limit}
     if search.strip():
-        found = q("""
+        sparams: dict[str, Any] = {"s": search.strip()}
+        scc = cluster_cond(cluster, sparams)
+        found = q(f"""
             SELECT DISTINCT queryid FROM queries
-            WHERE positionCaseInsensitive(query, %(s)s) > 0
+            WHERE positionCaseInsensitive(query, %(s)s) > 0 {scc}
             LIMIT 2000
-        """, {"s": search.strip()})
+        """, sparams)
         if not found:
             return []
         search_filter = "AND m.queryid IN %(qids)s"
@@ -150,7 +179,7 @@ def queries(hours: int = Query(24, ge=1, le=720),
                sum(m.shared_blks_read)                         AS blks_read,
                sum(m.temp_blks_written)                        AS temp_blks
         FROM statements_metrics m
-        WHERE m.ts > now() - INTERVAL %(hours)s HOUR {search_filter}
+        WHERE m.ts > now() - INTERVAL %(hours)s HOUR {cc} {search_filter}
         GROUP BY m.queryid
         ORDER BY {order} DESC
         LIMIT %(limit)s
@@ -159,21 +188,24 @@ def queries(hours: int = Query(24, ge=1, le=720),
     if not rows:
         return []
     ids = [r["queryid"] for r in rows]
-    texts = q("""
+
+    tparams: dict[str, Any] = {"ids": ids}
+    tcc = cluster_cond(cluster, tparams)
+    texts = q(f"""
         SELECT queryid, argMax(query, last_seen) AS query
         FROM queries
-        WHERE queryid IN %(ids)s
+        WHERE queryid IN %(ids)s {tcc}
         GROUP BY queryid
-    """, {"ids": ids})
+    """, tparams)
     text_by_id = {t["queryid"]: t["query"] for t in texts}
 
-    plans = q("""
+    plans = q(f"""
         SELECT queryid, uniqExact(fingerprint) AS plan_count,
                argMax(fingerprint, ts) AS last_fingerprint
         FROM query_plans
-        WHERE queryid IN %(ids)s
+        WHERE queryid IN %(ids)s {tcc}
         GROUP BY queryid
-    """, {"ids": ids})
+    """, tparams)
     plan_by_id = {p["queryid"]: p for p in plans}
 
     out = []
@@ -187,16 +219,21 @@ def queries(hours: int = Query(24, ge=1, le=720),
 
 
 @router.get("/query/{queryid}")
-def query_detail(queryid: int, hours: int = Query(24, ge=1, le=720)) -> dict:
+def query_detail(queryid: int, hours: int = Query(24, ge=1, le=720),
+                 cluster: str = "") -> dict:
     step = bucket_minutes(hours)
+    params: dict[str, Any] = {"qid": queryid, "hours": hours}
+    cc = cluster_cond(cluster, params)
 
-    meta = q("""
+    mparams: dict[str, Any] = {"qid": queryid}
+    mcc = cluster_cond(cluster, mparams, "qq.cluster")
+    meta = q(f"""
         SELECT argMax(qq.query, qq.last_seen)   AS query,
                argMax(qq.datname, qq.last_seen) AS datname,
                argMax(qq.usename, qq.last_seen) AS usename,
                max(qq.last_seen)                AS last_seen
-        FROM queries qq WHERE qq.queryid = %(qid)s GROUP BY qq.queryid
-    """, {"qid": queryid})
+        FROM queries qq WHERE qq.queryid = %(qid)s {mcc} GROUP BY qq.queryid
+    """, mparams)
     if not meta:
         raise HTTPException(404, "queryid не найден")
 
@@ -213,11 +250,11 @@ def query_detail(queryid: int, hours: int = Query(24, ge=1, le=720)) -> dict:
                sum(blk_read_time)                            AS blk_read_time,
                sum(wal_bytes)                                AS wal_bytes
         FROM statements_metrics
-        WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(hours)s HOUR
+        WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(hours)s HOUR {cc}
         GROUP BY t ORDER BY t
-    """, {"qid": queryid, "hours": hours})
+    """, params)
 
-    totals = q("""
+    totals = q(f"""
         SELECT sum(calls) AS calls,
                sum(total_exec_time) AS total_time,
                total_time / greatest(calls,1) AS mean_time,
@@ -225,37 +262,39 @@ def query_detail(queryid: int, hours: int = Query(24, ge=1, le=720)) -> dict:
                sum(shared_blks_read) AS blks_read,
                sum(shared_blks_hit)  AS blks_hit
         FROM statements_metrics
-        WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(hours)s HOUR
-    """, {"qid": queryid, "hours": hours})
+        WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(hours)s HOUR {cc}
+    """, params)
 
-    plans = q("""
+    plans = q(f"""
         SELECT ts, fingerprint, total_cost, tables, indexes,
                seq_scan_tables, node_types, source
         FROM query_plans
-        WHERE queryid = %(qid)s
+        WHERE queryid = %(qid)s {mcc.replace('qq.', '')}
         ORDER BY ts DESC LIMIT 50
-    """, {"qid": queryid})
+    """, mparams)
 
-    alerts = q("""
+    alerts = q(f"""
         SELECT ts, severity, kind, description, old_fingerprint, new_fingerprint
         FROM plan_alerts
-        WHERE queryid = %(qid)s
+        WHERE queryid = %(qid)s {mcc.replace('qq.', '')}
         ORDER BY ts DESC LIMIT 50
-    """, {"qid": queryid})
+    """, mparams)
 
     # запросы, работающие с теми же таблицами
     tables: list[str] = plans[0]["tables"] if plans else []
     related: list[dict] = []
     if tables:
-        related = q("""
+        rparams: dict[str, Any] = {"tables": tables, "qid": queryid}
+        rcc = cluster_cond(cluster, rparams, "p.cluster")
+        related = q(f"""
             SELECT DISTINCT p.queryid AS queryid,
                    argMax(q.query, q.last_seen) AS query
             FROM query_plans p
             LEFT JOIN queries q ON q.queryid = p.queryid
-            WHERE hasAny(p.tables, %(tables)s) AND p.queryid != %(qid)s
+            WHERE hasAny(p.tables, %(tables)s) AND p.queryid != %(qid)s {rcc}
             GROUP BY p.queryid
             LIMIT 30
-        """, {"tables": tables, "qid": queryid})
+        """, rparams)
 
     return {
         "queryid": str(queryid),
@@ -271,13 +310,15 @@ def query_detail(queryid: int, hours: int = Query(24, ge=1, le=720)) -> dict:
 
 
 @router.get("/query/{queryid}/plan/{fingerprint}")
-def plan_json(queryid: int, fingerprint: str) -> dict:
-    rows = q("""
+def plan_json(queryid: int, fingerprint: str, cluster: str = "") -> dict:
+    params: dict[str, Any] = {"qid": queryid, "fp": fingerprint}
+    cc = cluster_cond(cluster, params)
+    rows = q(f"""
         SELECT ts, plan_json, total_cost, source
         FROM query_plans
-        WHERE queryid = %(qid)s AND fingerprint = %(fp)s
+        WHERE queryid = %(qid)s AND fingerprint = %(fp)s {cc}
         ORDER BY ts DESC LIMIT 1
-    """, {"qid": queryid, "fp": fingerprint})
+    """, params)
     if not rows:
         raise HTTPException(404, "план не найден")
     r = rows[0]
@@ -286,14 +327,16 @@ def plan_json(queryid: int, fingerprint: str) -> dict:
 
 
 @router.get("/query/{queryid}/diff")
-def plan_diff(queryid: int, old: str, new: str) -> dict:
+def plan_diff(queryid: int, old: str, new: str, cluster: str = "") -> dict:
     """Сравнение двух планов запроса по фингерпринтам."""
     def load(fp: str) -> dict:
-        rows = q("""
+        params: dict[str, Any] = {"qid": queryid, "fp": fp}
+        cc = cluster_cond(cluster, params)
+        rows = q(f"""
             SELECT plan_json FROM query_plans
-            WHERE queryid = %(qid)s AND fingerprint = %(fp)s
+            WHERE queryid = %(qid)s AND fingerprint = %(fp)s {cc}
             ORDER BY ts DESC LIMIT 1
-        """, {"qid": queryid, "fp": fp})
+        """, params)
         if not rows:
             raise HTTPException(404, f"план {fp} не найден")
         return json.loads(rows[0]["plan_json"])
@@ -316,42 +359,47 @@ def plan_diff(queryid: int, old: str, new: str) -> dict:
 @router.get("/plans/search")
 def plans_search(text: str = Query("", alias="q"),
                  days: int = Query(7, ge=1, le=90),
-                 limit: int = Query(20, ge=1, le=100)) -> list[dict]:
+                 limit: int = Query(20, ge=1, le=100),
+                 cluster: str = "") -> list[dict]:
     """Ищет запросы по подстроке текста и возвращает версии их планов
     за период (последний план — первым). Если в периоде смен не было,
     возвращается последний известный план запроса."""
     if not text.strip():
         return []
-    hits = q("""
+    hparams: dict[str, Any] = {"s": text.strip(), "lim": limit}
+    hcc = cluster_cond(cluster, hparams, "qq.cluster")
+    hits = q(f"""
         SELECT qq.queryid AS queryid,
                argMax(qq.query, qq.last_seen)   AS query,
                argMax(qq.datname, qq.last_seen) AS datname,
                max(qq.last_seen)                AS last_seen
         FROM queries qq
-        WHERE positionCaseInsensitive(qq.query, %(s)s) > 0
+        WHERE positionCaseInsensitive(qq.query, %(s)s) > 0 {hcc}
         GROUP BY qq.queryid
         ORDER BY last_seen DESC
         LIMIT %(lim)s
-    """, {"s": text.strip(), "lim": limit})
+    """, hparams)
 
     out = []
     for h in hits:
-        plans = q("""
+        pparams: dict[str, Any] = {"qid": h["queryid"], "days": days}
+        pcc = cluster_cond(cluster, pparams)
+        plans = q(f"""
             SELECT ts, fingerprint, total_cost, tables, indexes,
                    seq_scan_tables, source
             FROM query_plans
-            WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(days)s DAY
+            WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(days)s DAY {pcc}
             ORDER BY ts DESC LIMIT 50
-        """, {"qid": h["queryid"], "days": days})
+        """, pparams)
         if not plans:
             # смен плана в периоде не было — показываем последний известный
-            plans = q("""
+            plans = q(f"""
                 SELECT ts, fingerprint, total_cost, tables, indexes,
                        seq_scan_tables, source
                 FROM query_plans
-                WHERE queryid = %(qid)s
+                WHERE queryid = %(qid)s {pcc}
                 ORDER BY ts DESC LIMIT 1
-            """, {"qid": h["queryid"]})
+            """, pparams)
         h["plans"] = plans
         out.append(h)
     return str_qids(out)
@@ -363,8 +411,11 @@ def plans_search(text: str = Query("", alias="q"),
 
 @router.get("/statements")
 def statements(hours: int = Query(24, ge=1, le=720),
-               top: int = Query(5, ge=1, le=8)) -> dict:
+               top: int = Query(5, ge=1, le=8),
+               cluster: str = "") -> dict:
     step = bucket_minutes(hours)
+    params: dict[str, Any] = {"hours": hours}
+    cc = cluster_cond(cluster, params)
 
     series = q(f"""
         SELECT toStartOfInterval(ts, INTERVAL {step} MINUTE) AS t,
@@ -379,26 +430,32 @@ def statements(hours: int = Query(24, ge=1, le=720),
                sum(blk_write_time)            AS blk_write_time,
                sum(wal_bytes)                 AS wal_bytes
         FROM statements_metrics
-        WHERE ts > now() - INTERVAL %(hours)s HOUR
+        WHERE ts > now() - INTERVAL %(hours)s HOUR {cc}
         GROUP BY t ORDER BY t
-    """, {"hours": hours})
+    """, params)
 
-    top_rows = q("""
+    tparams: dict[str, Any] = {"hours": hours, "top": top}
+    tcc = cluster_cond(cluster, tparams)
+    top_rows = q(f"""
         SELECT queryid, sum(total_exec_time) AS total_time
         FROM statements_metrics
-        WHERE ts > now() - INTERVAL %(hours)s HOUR
+        WHERE ts > now() - INTERVAL %(hours)s HOUR {tcc}
         GROUP BY queryid ORDER BY total_time DESC LIMIT %(top)s
-    """, {"hours": hours, "top": top})
+    """, tparams)
     top_ids = [r["queryid"] for r in top_rows]
 
     per_query: list[dict] = []
     if top_ids:
-        texts = q("""
+        xparams: dict[str, Any] = {"ids": top_ids}
+        xcc = cluster_cond(cluster, xparams)
+        texts = q(f"""
             SELECT queryid, argMax(query, last_seen) AS query
-            FROM queries WHERE queryid IN %(ids)s GROUP BY queryid
-        """, {"ids": top_ids})
+            FROM queries WHERE queryid IN %(ids)s {xcc} GROUP BY queryid
+        """, xparams)
         text_by_id = {t["queryid"]: t["query"] for t in texts}
 
+        bparams: dict[str, Any] = {"hours": hours, "ids": top_ids}
+        bcc = cluster_cond(cluster, bparams)
         buckets = q(f"""
             SELECT queryid,
                    toStartOfInterval(ts, INTERVAL {step} MINUTE) AS t,
@@ -406,9 +463,9 @@ def statements(hours: int = Query(24, ge=1, le=720),
                    sum(total_exec_time)           AS total_time,
                    total_time / greatest(calls,1) AS mean_time
             FROM statements_metrics
-            WHERE ts > now() - INTERVAL %(hours)s HOUR AND queryid IN %(ids)s
+            WHERE ts > now() - INTERVAL %(hours)s HOUR AND queryid IN %(ids)s {bcc}
             GROUP BY queryid, t ORDER BY t
-        """, {"hours": hours, "ids": top_ids})
+        """, bparams)
         by_id: dict = {}
         for b in buckets:
             by_id.setdefault(b["queryid"], []).append(
@@ -430,8 +487,10 @@ def statements(hours: int = Query(24, ge=1, le=720),
 # ---------------------------------------------------------------------------
 
 @router.get("/activity")
-def activity(hours: int = Query(1, ge=1, le=336)) -> dict:
+def activity(hours: int = Query(1, ge=1, le=336), cluster: str = "") -> dict:
     step = bucket_minutes(hours)
+    params: dict[str, Any] = {"hours": hours}
+    cc = cluster_cond(cluster, params)
 
     # средние активные сессии по типам ожиданий (Average Active Sessions)
     wait_series = q(f"""
@@ -439,35 +498,39 @@ def activity(hours: int = Query(1, ge=1, le=336)) -> dict:
                if(wait_event_type = '', 'CPU', wait_event_type) AS wait_type,
                count() / greatest(uniqExact(ts), 1) AS sessions
         FROM ash
-        WHERE ts > now() - INTERVAL %(hours)s HOUR AND state = 'active'
+        WHERE ts > now() - INTERVAL %(hours)s HOUR AND state = 'active' {cc}
         GROUP BY t, wait_type
         ORDER BY t
-    """, {"hours": hours})
+    """, params)
 
-    current = q("""
+    cparams: dict[str, Any] = {}
+    ccc = cluster_cond(cluster, cparams)
+    current = q(f"""
         SELECT *
         FROM ash
-        WHERE ts = (SELECT max(ts) FROM ash)
+        WHERE ts = (SELECT max(ts) FROM ash WHERE 1=1 {ccc}) {ccc}
         ORDER BY query_start
         LIMIT 1 BY pid
-    """)
+    """, cparams)
 
-    top_waits = q("""
+    top_waits = q(f"""
         SELECT if(wait_event = '', 'CPU', concat(wait_event_type, ':', wait_event)) AS wait,
                count() AS samples
         FROM ash
-        WHERE ts > now() - INTERVAL %(hours)s HOUR AND state = 'active'
+        WHERE ts > now() - INTERVAL %(hours)s HOUR AND state = 'active' {cc}
         GROUP BY wait ORDER BY samples DESC LIMIT 10
-    """, {"hours": hours})
+    """, params)
 
-    top_queries = q("""
+    aparams: dict[str, Any] = {"hours": hours}
+    acc = cluster_cond(cluster, aparams, "a.cluster")
+    top_queries = q(f"""
         SELECT a.queryid                     AS queryid,
                any(a.query)                  AS query,
                count()                       AS samples
         FROM ash a
-        WHERE a.ts > now() - INTERVAL %(hours)s HOUR AND a.state = 'active'
+        WHERE a.ts > now() - INTERVAL %(hours)s HOUR AND a.state = 'active' {acc}
         GROUP BY a.queryid ORDER BY samples DESC LIMIT 10
-    """, {"hours": hours})
+    """, aparams)
 
     return {"wait_series": wait_series, "current": str_qids(current),
             "top_waits": top_waits, "top_queries": str_qids(top_queries)}
@@ -478,24 +541,31 @@ def activity(hours: int = Query(1, ge=1, le=336)) -> dict:
 # ---------------------------------------------------------------------------
 
 @router.get("/locks")
-def locks(days: int = Query(7, ge=1, le=7), limit: int = Query(300, ge=1, le=2000)) -> dict:
-    current = q("""
+def locks(days: int = Query(7, ge=1, le=7), limit: int = Query(300, ge=1, le=2000),
+          cluster: str = "") -> dict:
+    cparams: dict[str, Any] = {}
+    ccc = cluster_cond(cluster, cparams)
+    current = q(f"""
         SELECT * FROM locks
-        WHERE ts = (SELECT max(ts) FROM locks WHERE ts > now() - INTERVAL 2 MINUTE)
+        WHERE ts = (SELECT max(ts) FROM locks
+                    WHERE ts > now() - INTERVAL 2 MINUTE {ccc}) {ccc}
         ORDER BY blocked_duration_s DESC
-    """)
-    history = q("""
+    """, cparams)
+
+    params: dict[str, Any] = {"days": days, "limit": limit}
+    cc = cluster_cond(cluster, params)
+    history = q(f"""
         SELECT * FROM locks
-        WHERE ts > now() - INTERVAL %(days)s DAY
+        WHERE ts > now() - INTERVAL %(days)s DAY {cc}
         ORDER BY ts DESC LIMIT %(limit)s
-    """, {"days": days, "limit": limit})
-    series = q("""
+    """, params)
+    series = q(f"""
         SELECT toStartOfInterval(ts, INTERVAL 10 MINUTE) AS t,
                uniqExact(blocked_pid) AS blocked_sessions
         FROM locks
-        WHERE ts > now() - INTERVAL %(days)s DAY
+        WHERE ts > now() - INTERVAL %(days)s DAY {cc}
         GROUP BY t ORDER BY t
-    """, {"days": days})
+    """, params)
     return {"current": current, "history": history, "series": series}
 
 
@@ -504,12 +574,14 @@ def locks(days: int = Query(7, ge=1, le=7), limit: int = Query(300, ge=1, le=200
 # ---------------------------------------------------------------------------
 
 @router.get("/alerts")
-def alerts(days: int = Query(7, ge=1, le=90), severity: str = "") -> list[dict]:
-    where = "ts > now() - INTERVAL %(days)s DAY"
+def alerts(days: int = Query(7, ge=1, le=90), severity: str = "",
+           cluster: str = "") -> list[dict]:
+    where = "a.ts > now() - INTERVAL %(days)s DAY"
     params: dict[str, Any] = {"days": days}
     if severity:
-        where += " AND severity = %(sev)s"
+        where += " AND a.severity = %(sev)s"
         params["sev"] = severity
+    where += " " + cluster_cond(cluster, params, "a.cluster")
     rows = q(f"""
         SELECT a.*, argMax(q.query, q.last_seen) AS query
         FROM plan_alerts a
@@ -525,24 +597,29 @@ def alerts(days: int = Query(7, ge=1, le=90), severity: str = "") -> list[dict]:
 
 
 @router.get("/alerts/badge")
-def alerts_badge() -> dict:
-    rows = q("""
+def alerts_badge(cluster: str = "") -> dict:
+    params: dict[str, Any] = {}
+    cc = cluster_cond(cluster, params)
+    rows = q(f"""
         SELECT severity, count() AS cnt FROM plan_alerts
-        WHERE ts > now() - INTERVAL 24 HOUR
+        WHERE ts > now() - INTERVAL 24 HOUR {cc}
         GROUP BY severity
-    """)
+    """, params)
     return {r["severity"]: r["cnt"] for r in rows}
 
 
 @router.get("/recommendations")
-def recommendations() -> list[dict]:
-    return str_qids(q("""
+def recommendations(cluster: str = "") -> list[dict]:
+    params: dict[str, Any] = {}
+    cc = cluster_cond(cluster, params)
+    return str_qids(q(f"""
         SELECT kind, datname, tablename, indexname, columns, reason, ddl,
                queryids, max(ts) AS ts
         FROM recommendations
+        WHERE 1=1 {cc}
         GROUP BY kind, datname, tablename, indexname, columns, reason, ddl, queryids
         ORDER BY kind, tablename
-    """))
+    """, params))
 
 
 # ---------------------------------------------------------------------------
@@ -550,11 +627,11 @@ def recommendations() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 @router.get("/tables")
-def tables_list(search: str = "") -> list[dict]:
-    where = ""
+def tables_list(search: str = "", cluster: str = "") -> list[dict]:
     params: dict[str, Any] = {}
+    where = cluster_cond(cluster, params)
     if search.strip():
-        where = "AND positionCaseInsensitive(relname, %(s)s) > 0"
+        where += " AND positionCaseInsensitive(relname, %(s)s) > 0"
         params["s"] = search.strip()
     rows = q(f"""
         SELECT datname, schemaname, relname,
@@ -578,29 +655,31 @@ def tables_list(search: str = "") -> list[dict]:
         LIMIT 500
     """, params)
 
-    bloat = q("""
+    bparams: dict[str, Any] = {}
+    bcc = cluster_cond(cluster, bparams)
+    bloat = q(f"""
         SELECT datname, schemaname, relname, kind,
                argMax(bloat_bytes, ts) AS bloat_bytes,
                argMax(bloat_pct, ts)   AS bloat_pct,
                argMax(real_bytes, ts)  AS real_bytes
         FROM bloat_stats
-        WHERE ts > now() - INTERVAL 2 DAY AND kind = 'table'
+        WHERE ts > now() - INTERVAL 2 DAY AND kind = 'table' {bcc}
         GROUP BY datname, schemaname, relname, kind
-    """)
+    """, bparams)
     bloat_by_tbl = {(b["datname"], b["schemaname"], b["relname"]): b for b in bloat}
 
-    idx_bloat = q("""
+    idx_bloat = q(f"""
         SELECT datname, schemaname, relname,
                sum(b) AS idx_bloat_bytes
         FROM (
             SELECT datname, schemaname, relname, indexrelname,
                    argMax(bloat_bytes, ts) AS b
             FROM bloat_stats
-            WHERE ts > now() - INTERVAL 2 DAY AND kind = 'index'
+            WHERE ts > now() - INTERVAL 2 DAY AND kind = 'index' {bcc}
             GROUP BY datname, schemaname, relname, indexrelname
         )
         GROUP BY datname, schemaname, relname
-    """)
+    """, bparams)
     ib_by_tbl = {(b["datname"], b["schemaname"], b["relname"]): b["idx_bloat_bytes"]
                  for b in idx_bloat}
 
@@ -614,8 +693,11 @@ def tables_list(search: str = "") -> list[dict]:
 
 
 @router.get("/table/{datname}/{table}")
-def table_detail(datname: str, table: str) -> dict:
-    stats = q("""
+def table_detail(datname: str, table: str, cluster: str = "") -> dict:
+    params: dict[str, Any] = {"d": datname, "t": table}
+    cc = cluster_cond(cluster, params)
+
+    stats = q(f"""
         SELECT relname, schemaname,
                argMax(seq_scan, ts) AS seq_scan,
                argMax(idx_scan, ts) AS idx_scan,
@@ -633,11 +715,11 @@ def table_detail(datname: str, table: str) -> dict:
                argMax(analyze_count, ts)    AS analyze_count,
                argMax(autoanalyze_count, ts) AS autoanalyze_count
         FROM table_stats
-        WHERE datname = %(d)s AND relname = %(t)s
+        WHERE datname = %(d)s AND relname = %(t)s {cc}
         GROUP BY relname, schemaname
-    """, {"d": datname, "t": table})
+    """, params)
 
-    indexes = q("""
+    indexes = q(f"""
         SELECT indexrelname,
                max(idx_scan) - min(idx_scan) AS idx_scan_delta,
                argMax(size_bytes, ts) AS size_bytes,
@@ -645,32 +727,34 @@ def table_detail(datname: str, table: str) -> dict:
                argMax(is_unique, ts) AS is_unique,
                argMax(is_primary, ts) AS is_primary
         FROM index_stats
-        WHERE datname = %(d)s AND relname = %(t)s
+        WHERE datname = %(d)s AND relname = %(t)s {cc}
         GROUP BY indexrelname
         ORDER BY size_bytes DESC
-    """, {"d": datname, "t": table})
+    """, params)
 
-    queries_rows = q("""
+    qparams: dict[str, Any] = {"d": datname, "t": table}
+    qcc = cluster_cond(cluster, qparams, "p.cluster")
+    queries_rows = q(f"""
         SELECT p.queryid AS queryid,
                argMax(q.query, q.last_seen) AS query,
                argMax(p.indexes, p.ts) AS indexes,
                max(p.ts) AS last_plan
         FROM query_plans p
         LEFT JOIN queries q ON q.queryid = p.queryid
-        WHERE has(p.tables, %(t)s) AND p.datname = %(d)s
+        WHERE has(p.tables, %(t)s) AND p.datname = %(d)s {qcc}
         GROUP BY p.queryid
         LIMIT 100
-    """, {"d": datname, "t": table})
+    """, qparams)
 
-    bloat = q("""
+    bloat = q(f"""
         SELECT indexrelname, kind,
                argMax(bloat_bytes, ts) AS bloat_bytes,
                argMax(bloat_pct, ts)   AS bloat_pct
         FROM bloat_stats
-        WHERE datname = %(d)s AND relname = %(t)s
+        WHERE datname = %(d)s AND relname = %(t)s {cc}
           AND ts > now() - INTERVAL 2 DAY
         GROUP BY indexrelname, kind
-    """, {"d": datname, "t": table})
+    """, params)
     table_bloat = next((b for b in bloat if b["kind"] == "table"), {})
     idx_bloat = {b["indexrelname"]: b for b in bloat if b["kind"] == "index"}
     for i in indexes:

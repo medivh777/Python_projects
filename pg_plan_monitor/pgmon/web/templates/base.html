@@ -22,6 +22,8 @@
   <a href="/locks" class="{{ 'active' if path == '/locks' }}">Блокировки</a>
   <a href="/alerts" class="{{ 'active' if path == '/alerts' }}">Алерты <span id="alert-badge" class="badge" hidden></span></a>
   <a href="/recommendations" class="{{ 'active' if path == '/recommendations' }}">Рекомендации</a>
+  <span style="flex:1"></span>
+  <select id="cluster-select" title="Кластер PostgreSQL" hidden></select>
 </nav>
 <main class="viz-root">
   {% block content %}{% endblock %}

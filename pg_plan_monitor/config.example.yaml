@@ -4,13 +4,22 @@
 # например PGMON_CLICKHOUSE_HOST=ch1.local
 
 clusters:
-  # Можно мониторить несколько кластеров PostgreSQL одновременно.
+  # Можно мониторить несколько кластеров (серверов) PostgreSQL одновременно:
+  # каждый элемент списка — отдельный сервер со своим DSN. Для каждого
+  # кластера поднимается свой набор коллекторов, а в шапке сайта появляется
+  # переключатель кластеров (когда их больше одного).
   - name: main
     # DSN учётки мониторинга (см. sql/pg_setup.sql — роль pg_monitor + pg_stat_statements)
     dsn: postgresql://pgmon:pgmon@postgres:5432/postgres
     # Список БД, в которых снимать планы/статистику таблиц.
     # Пустой список = автообнаружение всех не-шаблонных БД.
     databases: []
+  # - name: replica-analytics
+  #   dsn: postgresql://pgmon:secret@10.0.0.12:5432/postgres
+  #   databases: [analytics, reports]   # мониторить только эти БД
+  # - name: billing
+  #   dsn: postgresql://pgmon:secret@billing-db.internal:5433/postgres
+  #   databases: []
 
 clickhouse:
   host: clickhouse

@@ -22,11 +22,43 @@ function waitColor(name, idx) {
   return (WAIT_COLORS[name] || (() => PAL()[idx % 8]))();
 }
 
+/* Выбранный кластер добавляется ко всем запросам API автоматически. */
+function currentCluster() {
+  return localStorage.getItem('pgmon-cluster') || '';
+}
 async function getJSON(url) {
+  const c = currentCluster();
+  if (c && url.startsWith('/api/')) {
+    url += (url.includes('?') ? '&' : '?') + 'cluster=' + encodeURIComponent(c);
+  }
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${url}: ${r.status}`);
   return r.json();
 }
+
+/* Селектор кластера в шапке: виден только когда кластеров больше одного. */
+async function initClusterSelect() {
+  const sel = document.getElementById('cluster-select');
+  if (!sel) return;
+  try {
+    const clusters = await (await fetch('/api/clusters')).json();
+    if (!Array.isArray(clusters) || clusters.length < 2) {
+      localStorage.removeItem('pgmon-cluster');
+      return;
+    }
+    let saved = currentCluster();
+    if (!clusters.includes(saved)) saved = clusters[0];
+    localStorage.setItem('pgmon-cluster', saved);
+    sel.innerHTML = clusters.map(c =>
+      `<option value="${esc(c)}" ${c === saved ? 'selected' : ''}>кластер: ${esc(c)}</option>`).join('');
+    sel.hidden = false;
+    sel.addEventListener('change', () => {
+      localStorage.setItem('pgmon-cluster', sel.value);
+      location.reload();
+    });
+  } catch (e) { /* API недоступен — селектор не показываем */ }
+}
+initClusterSelect();
 
 const fmtMs = v => {
   if (v == null) return '—';
