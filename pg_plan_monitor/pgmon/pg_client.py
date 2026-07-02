@@ -233,8 +233,141 @@ SELECT
     coalesce(s.idx_scan, 0)                  AS idx_scan,
     s.n_live_tup,
     s.n_dead_tup,
-    pg_total_relation_size(s.relid)::bigint  AS total_bytes
+    s.n_mod_since_analyze,
+    pg_total_relation_size(s.relid)::bigint  AS total_bytes,
+    CASE WHEN c.reltoastrelid <> 0
+         THEN pg_total_relation_size(c.reltoastrelid)::bigint
+         ELSE 0 END                          AS toast_bytes,
+    coalesce(s.last_vacuum,      'epoch'::timestamptz) AS last_vacuum,
+    coalesce(s.last_autovacuum,  'epoch'::timestamptz) AS last_autovacuum,
+    coalesce(s.last_analyze,     'epoch'::timestamptz) AS last_analyze,
+    coalesce(s.last_autoanalyze, 'epoch'::timestamptz) AS last_autoanalyze,
+    s.vacuum_count,
+    s.autovacuum_count,
+    s.analyze_count,
+    s.autoanalyze_count
 FROM pg_stat_user_tables s
+JOIN pg_class c ON c.oid = s.relid
+"""
+
+# Оценка bloat таблиц (по мотивам ioguix/pgsql-bloat-estimation).
+# Работает по статистике планировщика, данные таблиц не читает.
+SQL_TABLE_BLOAT = """
+SELECT current_database() AS datname, schemaname, tblname AS relname,
+       (tblpages * bs)::bigint AS real_bytes,
+       CASE WHEN tblpages - est_tblpages_ff > 0
+            THEN ((tblpages - est_tblpages_ff) * bs)::bigint ELSE 0 END AS bloat_bytes,
+       CASE WHEN tblpages > 0 AND tblpages - est_tblpages_ff > 0
+            THEN round((100 * (tblpages - est_tblpages_ff) / tblpages::float)::numeric, 1)::float
+            ELSE 0 END AS bloat_pct
+FROM (
+  SELECT ceil( greatest(reltuples, 0) / ( (bs - page_hdr) * fillfactor / (tpl_size * 100) ) )
+           + ceil( toasttuples / 4 ) AS est_tblpages_ff,
+         tblpages, bs, schemaname, tblname
+  FROM (
+    SELECT ( 4 + tpl_hdr_size + tpl_data_size + (2 * ma)
+             - CASE WHEN tpl_hdr_size % ma = 0 THEN ma ELSE tpl_hdr_size % ma END
+             - CASE WHEN ceil(tpl_data_size)::int % ma = 0 THEN ma
+                    ELSE ceil(tpl_data_size)::int % ma END
+           ) AS tpl_size,
+           heappages + toastpages AS tblpages,
+           reltuples, toasttuples, bs, page_hdr, fillfactor, schemaname, tblname
+    FROM (
+      SELECT ns.nspname AS schemaname, tbl.relname AS tblname, tbl.reltuples,
+             tbl.relpages AS heappages, coalesce(toast.relpages, 0) AS toastpages,
+             coalesce(toast.reltuples, 0) AS toasttuples,
+             coalesce(substring(array_to_string(tbl.reloptions, ' ')
+                      FROM 'fillfactor=([0-9]+)')::smallint, 100) AS fillfactor,
+             current_setting('block_size')::numeric AS bs,
+             CASE WHEN version() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64'
+                  THEN 8 ELSE 4 END AS ma,
+             24 AS page_hdr,
+             23 + CASE WHEN max(coalesce(st.null_frac, 0)) > 0
+                       THEN (7 + count(st.attname)) / 8 ELSE 0::int END AS tpl_hdr_size,
+             sum((1 - coalesce(st.null_frac, 0)) * coalesce(st.avg_width, 0)) AS tpl_data_size
+      FROM pg_attribute att
+      JOIN pg_class tbl ON att.attrelid = tbl.oid
+      JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+      LEFT JOIN pg_stats st ON st.schemaname = ns.nspname
+           AND st.tablename = tbl.relname AND st.attname = att.attname
+      LEFT JOIN pg_class toast ON tbl.reltoastrelid = toast.oid
+      WHERE att.attnum > 0 AND NOT att.attisdropped
+        AND tbl.relkind = 'r' AND tbl.relpages > 0
+        AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+      GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+    ) s
+  ) s2
+  WHERE tpl_size > 0
+) s3
+"""
+
+# Оценка bloat btree-индексов (по мотивам ioguix/pgsql-bloat-estimation).
+# Индексы по выражениям пропускаются (нет статистики по колонке).
+SQL_INDEX_BLOAT = """
+SELECT current_database() AS datname, nspname AS schemaname,
+       tblname AS relname, idxname AS indexrelname,
+       (relpages * bs)::bigint AS real_bytes,
+       CASE WHEN relpages > est_pages_ff
+            THEN ((relpages - est_pages_ff) * bs)::bigint ELSE 0 END AS bloat_bytes,
+       CASE WHEN relpages > 0 AND relpages > est_pages_ff
+            THEN round((100 * (relpages - est_pages_ff)::float / relpages)::numeric, 1)::float
+            ELSE 0 END AS bloat_pct
+FROM (
+  SELECT coalesce(1 + ceil(greatest(reltuples, 0) /
+             floor((bs - pageopqdata - pagehdr) * fillfactor
+                   / (100 * (4 + nulldatahdrwidth)::float))), 0) AS est_pages_ff,
+         bs, nspname, tblname, idxname, relpages
+  FROM (
+    SELECT maxalign, bs, nspname, tblname, idxname, reltuples, relpages, fillfactor,
+           ( index_tuple_hdr_bm + maxalign
+             - CASE WHEN index_tuple_hdr_bm % maxalign = 0
+                    THEN maxalign ELSE index_tuple_hdr_bm % maxalign END
+             + nulldatawidth + maxalign
+             - CASE WHEN nulldatawidth = 0 THEN 0
+                    WHEN nulldatawidth::integer % maxalign = 0 THEN maxalign
+                    ELSE nulldatawidth::integer % maxalign END
+           )::numeric AS nulldatahdrwidth, pagehdr, pageopqdata
+    FROM (
+      SELECT n.nspname, i.tblname, i.idxname, i.reltuples, i.relpages, i.fillfactor,
+             current_setting('block_size')::numeric AS bs,
+             CASE WHEN version() ~ 'mingw32|64-bit|x86_64|ppc64|ia64|amd64'
+                  THEN 8 ELSE 4 END AS maxalign,
+             24 AS pagehdr, 16 AS pageopqdata,
+             CASE WHEN max(coalesce(s.null_frac, 0)) = 0 THEN 8
+                  ELSE 8 + ((32 + 8 - 1) / 8) END AS index_tuple_hdr_bm,
+             sum((1 - coalesce(s.null_frac, 0)) * coalesce(s.avg_width, 1024)) AS nulldatawidth
+      FROM (
+        SELECT ct.relname AS tblname, ct.relnamespace, ic.idxname, ic.attpos,
+               ic.indkey[ic.attpos] AS indattnum,
+               ic.reltuples, ic.relpages, ic.tbloid, ic.fillfactor
+        FROM (
+          SELECT idxname, reltuples, relpages, tbloid, fillfactor, indkey,
+                 generate_series(1, indnatts) AS attpos
+          FROM (
+            SELECT ci.relname AS idxname, ci.reltuples, ci.relpages,
+                   i.indrelid AS tbloid,
+                   coalesce(substring(array_to_string(ci.reloptions, ' ')
+                            FROM 'fillfactor=([0-9]+)')::smallint, 90) AS fillfactor,
+                   i.indnatts,
+                   string_to_array(textin(int2vectorout(i.indkey)), ' ')::int[] AS indkey
+            FROM pg_index i
+            JOIN pg_class ci ON ci.oid = i.indexrelid
+            WHERE ci.relam = (SELECT oid FROM pg_am WHERE amname = 'btree')
+              AND ci.relpages > 0
+          ) idx_data
+        ) ic
+        JOIN pg_class ct ON ct.oid = ic.tbloid
+      ) i
+      JOIN pg_attribute a ON a.attrelid = i.tbloid AND a.attnum = i.indattnum
+      JOIN pg_namespace n ON n.oid = i.relnamespace
+      JOIN pg_stats s ON s.schemaname = n.nspname
+           AND s.tablename = i.tblname AND s.attname = a.attname
+      WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+        AND i.indattnum > 0
+      GROUP BY 1, 2, 3, 4, 5, 6
+    ) rows_data_stats
+  ) rows_hdr_pdg_stats
+) relation_stats
 """
 
 SQL_INDEX_STATS = """

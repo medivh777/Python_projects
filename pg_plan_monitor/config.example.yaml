@@ -29,7 +29,8 @@ intervals:
   locks: 10            # дерево блокировок (пишется только когда есть блокировки)
   sysstat: 15          # pg_stat_database / bgwriter (+ psutil, если включён)
   plans: 300           # снятие планов топ-N запросов через EXPLAIN
-  table_stats: 600     # pg_stat_user_tables / indexes + размеры
+  table_stats: 600     # pg_stat_user_tables / indexes + размеры + vacuum info
+  bloat: 3600          # оценка bloat таблиц/индексов (по статистике, без чтения данных)
   recommend: 1800      # пересчёт рекомендаций по индексам
 
 plans:

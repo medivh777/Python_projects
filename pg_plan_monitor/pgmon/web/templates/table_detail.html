@@ -4,10 +4,13 @@
 
 <div class="tiles" id="tiles"></div>
 
+<h2>Vacuum / Analyze</h2>
+<div class="tiles" id="vac-tiles"></div>
+
 <h2>Индексы</h2>
 <table class="data"><thead><tr>
   <th>Индекс</th><th class="num">Использований за период</th><th class="num">Размер</th>
-  <th>Свойства</th><th>Определение</th>
+  <th class="num">Bloat</th><th>Свойства</th><th>Определение</th>
 </tr></thead><tbody id="idx-tbody"></tbody></table>
 
 <h2>Запросы, работающие с таблицей</h2>
@@ -19,23 +22,43 @@
 {% block scripts %}
 <script>
 const DAT = {{ datname | tojson }}, TBL = {{ table | tojson }};
+const EPOCH_TS = t => !t || String(t).startsWith('1970');
+const vacVal = t => EPOCH_TS(t) ? '—' : fmtTs(String(t));
+
 async function load() {
   const d = await getJSON(`/api/table/${encodeURIComponent(DAT)}/${encodeURIComponent(TBL)}`);
   const s = d.stats || {};
+  const tb = d.table_bloat || {};
   document.getElementById('tiles').innerHTML = `
     <div class="tile"><div class="label">Размер (с индексами)</div><div class="value">${fmtBytes(s.total_bytes)}</div></div>
+    <div class="tile"><div class="label">TOAST</div><div class="value">${s.toast_bytes ? fmtBytes(s.toast_bytes) : '—'}</div></div>
+    <div class="tile"><div class="label">Bloat таблицы</div>
+      <div class="value">${tb.bloat_bytes ? fmtBytes(tb.bloat_bytes) : '—'}</div>
+      <div class="sub">${tb.bloat_pct ? Number(tb.bloat_pct).toFixed(0) + '% страниц' : ''}</div></div>
     <div class="tile"><div class="label">Живых строк</div><div class="value">${fmtNum(s.n_live_tup)}</div></div>
     <div class="tile"><div class="label">Мёртвых строк</div><div class="value">${fmtNum(s.n_dead_tup)}</div></div>
-    <div class="tile"><div class="label">Seq Scan (всего)</div><div class="value">${fmtNum(s.seq_scan)}</div></div>
-    <div class="tile"><div class="label">Index Scan (всего)</div><div class="value">${fmtNum(s.idx_scan)}</div></div>`;
+    <div class="tile"><div class="label">Seq / Index Scan</div><div class="value">${fmtNum(s.seq_scan)} / ${fmtNum(s.idx_scan)}</div></div>`;
+
+  document.getElementById('vac-tiles').innerHTML = `
+    <div class="tile"><div class="label">Последний vacuum (ручной)</div><div class="value" style="font-size:16px">${vacVal(s.last_vacuum)}</div>
+      <div class="sub">всего: ${fmtNum(s.vacuum_count)}</div></div>
+    <div class="tile"><div class="label">Последний autovacuum</div><div class="value" style="font-size:16px">${vacVal(s.last_autovacuum)}</div>
+      <div class="sub">всего: ${fmtNum(s.autovacuum_count)}</div></div>
+    <div class="tile"><div class="label">Последний analyze (ручной)</div><div class="value" style="font-size:16px">${vacVal(s.last_analyze)}</div>
+      <div class="sub">всего: ${fmtNum(s.analyze_count)}</div></div>
+    <div class="tile"><div class="label">Последний autoanalyze</div><div class="value" style="font-size:16px">${vacVal(s.last_autoanalyze)}</div>
+      <div class="sub">всего: ${fmtNum(s.autoanalyze_count)}</div></div>
+    <div class="tile"><div class="label">Изменений после analyze</div><div class="value" style="font-size:16px">${fmtNum(s.n_mod_since_analyze)}</div>
+      <div class="sub">n_mod_since_analyze</div></div>`;
 
   document.getElementById('idx-tbody').innerHTML = (d.indexes || []).map(i => `
     <tr><td class="mono">${esc(i.indexrelname)}</td>
         <td class="num">${fmtNum(i.idx_scan_delta)}${Number(i.idx_scan_delta) === 0 ? ' <span class="sev warning">⚠ не используется</span>' : ''}</td>
         <td class="num">${fmtBytes(i.size_bytes)}</td>
+        <td class="num">${i.bloat_bytes ? fmtBytes(i.bloat_bytes) + ' <span class="muted">(' + Number(i.bloat_pct).toFixed(0) + '%)</span>' : '—'}</td>
         <td>${i.is_primary ? 'PK' : ''} ${i.is_unique ? 'UNIQUE' : ''}</td>
         <td class="mono">${esc(i.definition)}</td></tr>`).join('')
-    || '<tr><td colspan="5" class="muted">нет данных</td></tr>';
+    || '<tr><td colspan="6" class="muted">нет данных</td></tr>';
 
   document.getElementById('q-tbody').innerHTML = (d.queries || []).map(r => `
     <tr><td><a href="/query/${r.queryid}" class="mono">${r.queryid}</a></td>

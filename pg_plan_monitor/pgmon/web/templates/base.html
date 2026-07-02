@@ -14,8 +14,11 @@
 <nav class="topnav">
   <span class="brand">pg_plan_monitor</span>
   <a href="/" class="{{ 'active' if path == '/' }}">Дашборд</a>
+  <a href="/statements" class="{{ 'active' if path == '/statements' }}">Statements</a>
   <a href="/queries" class="{{ 'active' if path.startswith('/quer') }}">Запросы</a>
+  <a href="/plans" class="{{ 'active' if path == '/plans' }}">Планы</a>
   <a href="/activity" class="{{ 'active' if path == '/activity' }}">Активность</a>
+  <a href="/tables" class="{{ 'active' if path.startswith('/table') }}">Таблицы</a>
   <a href="/locks" class="{{ 'active' if path == '/locks' }}">Блокировки</a>
   <a href="/alerts" class="{{ 'active' if path == '/alerts' }}">Алерты <span id="alert-badge" class="badge" hidden></span></a>
   <a href="/recommendations" class="{{ 'active' if path == '/recommendations' }}">Рекомендации</a>

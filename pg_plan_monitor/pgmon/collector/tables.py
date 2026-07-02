@@ -1,4 +1,8 @@
-"""Снапшоты статистики таблиц и индексов по всем наблюдаемым БД кластера."""
+"""Снапшоты статистики таблиц и индексов по всем наблюдаемым БД кластера.
+
+Помимо размеров и счётчиков сканирований снимаются toast-размер и
+vacuum-информация (когда и сколько раз проходил vacuum/analyze).
+"""
 
 from __future__ import annotations
 
@@ -12,12 +16,25 @@ log = logging.getLogger(__name__)
 
 TABLE_COLUMNS = [
     "ts", "cluster", "datname", "schemaname", "relname",
-    "seq_scan", "idx_scan", "n_live_tup", "n_dead_tup", "total_bytes",
+    "seq_scan", "idx_scan", "n_live_tup", "n_dead_tup", "n_mod_since_analyze",
+    "total_bytes", "toast_bytes",
+    "last_vacuum", "last_autovacuum", "last_analyze", "last_autoanalyze",
+    "vacuum_count", "autovacuum_count", "analyze_count", "autoanalyze_count",
 ]
 INDEX_COLUMNS = [
     "ts", "cluster", "datname", "schemaname", "relname", "indexrelname",
     "idx_scan", "size_bytes", "is_unique", "is_primary", "definition",
 ]
+
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _dt(value) -> datetime:
+    if value is None:
+        return _EPOCH
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 class TableStatsCollector(Collector):
@@ -53,7 +70,13 @@ class TableStatsCollector(Collector):
                         now, self.cluster_name, datname, r["schemaname"],
                         r["relname"], int(r["seq_scan"] or 0),
                         int(r["idx_scan"] or 0), int(r["n_live_tup"] or 0),
-                        int(r["n_dead_tup"] or 0), int(r["total_bytes"] or 0),
+                        int(r["n_dead_tup"] or 0),
+                        int(r["n_mod_since_analyze"] or 0),
+                        int(r["total_bytes"] or 0), int(r["toast_bytes"] or 0),
+                        _dt(r["last_vacuum"]), _dt(r["last_autovacuum"]),
+                        _dt(r["last_analyze"]), _dt(r["last_autoanalyze"]),
+                        int(r["vacuum_count"] or 0), int(r["autovacuum_count"] or 0),
+                        int(r["analyze_count"] or 0), int(r["autoanalyze_count"] or 0),
                     ])
                 for r in conn.query(pg_client.SQL_INDEX_STATS):
                     index_rows.append([

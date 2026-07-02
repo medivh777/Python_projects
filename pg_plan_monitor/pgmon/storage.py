@@ -214,22 +214,50 @@ def schema_ddl(cfg: Config) -> list[str]:
         ORDER BY (cluster, ts)
         TTL ts + INTERVAL {metrics_days} DAY
         """,
-        # Снапшоты статистики таблиц.
+        # Снапшоты статистики таблиц (+ toast и vacuum-информация).
         f"""
         CREATE TABLE IF NOT EXISTS table_stats (
-            ts             DateTime,
-            cluster        LowCardinality(String),
-            datname        LowCardinality(String),
-            schemaname     LowCardinality(String),
-            relname        String,
-            seq_scan       UInt64,
-            idx_scan       UInt64,
-            n_live_tup     UInt64,
-            n_dead_tup     UInt64,
-            total_bytes    UInt64
+            ts                  DateTime,
+            cluster             LowCardinality(String),
+            datname             LowCardinality(String),
+            schemaname          LowCardinality(String),
+            relname             String,
+            seq_scan            UInt64,
+            idx_scan            UInt64,
+            n_live_tup          UInt64,
+            n_dead_tup          UInt64,
+            n_mod_since_analyze UInt64,
+            total_bytes         UInt64,
+            toast_bytes         UInt64,
+            last_vacuum         DateTime,
+            last_autovacuum     DateTime,
+            last_analyze        DateTime,
+            last_autoanalyze    DateTime,
+            vacuum_count        UInt64,
+            autovacuum_count    UInt64,
+            analyze_count       UInt64,
+            autoanalyze_count   UInt64
         ) ENGINE = MergeTree
         PARTITION BY toYYYYMM(ts)
         ORDER BY (cluster, datname, schemaname, relname, ts)
+        TTL ts + INTERVAL {metrics_days} DAY
+        """,
+        # Оценка bloat таблиц и индексов (kind = 'table' | 'index').
+        f"""
+        CREATE TABLE IF NOT EXISTS bloat_stats (
+            ts            DateTime,
+            cluster       LowCardinality(String),
+            datname       LowCardinality(String),
+            schemaname    LowCardinality(String),
+            relname       String,
+            indexrelname  String,
+            kind          LowCardinality(String),
+            real_bytes    UInt64,
+            bloat_bytes   UInt64,
+            bloat_pct     Float32
+        ) ENGINE = MergeTree
+        PARTITION BY toYYYYMM(ts)
+        ORDER BY (cluster, datname, schemaname, relname, indexrelname, ts)
         TTL ts + INTERVAL {metrics_days} DAY
         """,
         # Снапшоты статистики индексов (для рекомендаций «удалить неиспользуемый»).
@@ -270,8 +298,23 @@ def schema_ddl(cfg: Config) -> list[str]:
     ]
 
 
+# Миграции для установок, созданных до добавления новых колонок.
+MIGRATIONS = [
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS n_mod_since_analyze UInt64",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS toast_bytes UInt64",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS last_vacuum DateTime",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS last_autovacuum DateTime",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS last_analyze DateTime",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS last_autoanalyze DateTime",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS vacuum_count UInt64",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS autovacuum_count UInt64",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS analyze_count UInt64",
+    "ALTER TABLE table_stats ADD COLUMN IF NOT EXISTS autoanalyze_count UInt64",
+]
+
+
 def ensure_schema(cfg: Config) -> None:
-    """Создаёт БД и таблицы, если их нет."""
+    """Создаёт БД и таблицы, если их нет; докатывает миграции."""
     ch = cfg.clickhouse
     admin = clickhouse_connect.get_client(
         host=ch["host"], port=int(ch["port"]),
@@ -284,6 +327,8 @@ def ensure_schema(cfg: Config) -> None:
     cli = make_client(cfg)
     for ddl in schema_ddl(cfg):
         cli.command(ddl)
+    for mig in MIGRATIONS:
+        cli.command(mig)
     cli.close()
     log.info("Схема ClickHouse готова (%s)", ch["database"])
 

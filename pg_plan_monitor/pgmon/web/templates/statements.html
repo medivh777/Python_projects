@@ -1,0 +1,88 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Statements</h1>
+<div class="filters">
+  <label>Период:</label>
+  <select id="hours">
+    <option value="1">1 час</option>
+    <option value="6">6 часов</option>
+    <option value="24" selected>Сутки</option>
+    <option value="168">Неделя</option>
+    <option value="720">Месяц</option>
+  </select>
+  <span class="muted">агрегаты pg_stat_statements из ClickHouse</span>
+</div>
+
+<div class="grid-2">
+  <div class="card"><h3>Суммарное время выполнения (мс за интервал)</h3><div class="chart-box"><canvas id="ch-total"></canvas></div></div>
+  <div class="card"><h3>Среднее время выполнения</h3><div class="chart-box"><canvas id="ch-mean"></canvas></div></div>
+  <div class="card"><h3>Вызовы (calls)</h3><div class="chart-box"><canvas id="ch-calls"></canvas></div></div>
+  <div class="card"><h3>Строк возвращено</h3><div class="chart-box"><canvas id="ch-rows"></canvas></div></div>
+  <div class="card"><h3>Блоки: диск vs кэш</h3><div class="chart-box"><canvas id="ch-io"></canvas></div></div>
+  <div class="card"><h3>Время I/O, мс (track_io_timing)</h3><div class="chart-box"><canvas id="ch-iotime"></canvas></div></div>
+  <div class="card"><h3>Temp-блоки записано</h3><div class="chart-box"><canvas id="ch-temp"></canvas></div></div>
+  <div class="card"><h3>WAL, байт</h3><div class="chart-box"><canvas id="ch-wal"></canvas></div></div>
+</div>
+
+<h2>Топ-запросы: среднее время по каждому</h2>
+<div class="card">
+  <div class="chart-box" style="height:300px"><canvas id="ch-top"></canvas></div>
+</div>
+<table class="data">
+  <thead><tr><th></th><th>query_id</th><th>Запрос</th><th class="num">Суммарное время</th></tr></thead>
+  <tbody id="top-tbody"></tbody>
+</table>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let charts = [];
+async function load() {
+  charts.forEach(c => c && c.destroy());
+  charts = [];
+  const hours = document.getElementById('hours').value;
+  const d = await getJSON(`/api/statements?hours=${hours}`);
+  const s = d.series;
+
+  charts.push(lineChart('ch-total',
+    [{label: 'суммарное время', data: toXY(s, 't', 'total_time'), fill: true}], fmtMs));
+  charts.push(lineChart('ch-mean',
+    [{label: 'среднее', data: toXY(s, 't', 'mean_time'), color: cssVar('--series-5'), fill: true}], fmtMs));
+  charts.push(lineChart('ch-calls',
+    [{label: 'calls', data: toXY(s, 't', 'calls'), color: cssVar('--series-2'), fill: true}], fmtNum));
+  charts.push(lineChart('ch-rows',
+    [{label: 'rows', data: toXY(s, 't', 'rows'), color: cssVar('--series-4'), fill: true}], fmtNum));
+  charts.push(lineChart('ch-io', [
+    {label: 'с диска', data: toXY(s, 't', 'blks_read'), color: cssVar('--series-8')},
+    {label: 'из кэша', data: toXY(s, 't', 'blks_hit'), color: cssVar('--series-1')},
+  ], fmtNum));
+  charts.push(lineChart('ch-iotime', [
+    {label: 'чтение', data: toXY(s, 't', 'blk_read_time')},
+    {label: 'запись', data: toXY(s, 't', 'blk_write_time'), color: cssVar('--series-5')},
+  ], fmtNum));
+  charts.push(lineChart('ch-temp',
+    [{label: 'temp-блоков', data: toXY(s, 't', 'temp_blks_written'), color: cssVar('--series-3'), fill: true}], fmtNum));
+  charts.push(lineChart('ch-wal',
+    [{label: 'WAL', data: toXY(s, 't', 'wal_bytes'), color: cssVar('--series-7'), fill: true}], fmtBytes));
+
+  // линии топ-запросов: цвет закреплён за запросом на всё время страницы
+  const top = d.top_queries || [];
+  charts.push(lineChart('ch-top', top.map((tq, i) => ({
+    label: tq.queryid,
+    data: toXY(tq.series, 't', 'mean_time'),
+    color: PAL()[i % 8],
+  })), fmtMs));
+
+  document.getElementById('top-tbody').innerHTML = top.map((tq, i) => `
+    <tr>
+      <td><span style="display:inline-block;width:12px;height:12px;border-radius:3px;background:${PAL()[i % 8]}"></span></td>
+      <td><a href="/query/${tq.queryid}" class="mono">${tq.queryid}</a></td>
+      <td><div class="sql">${esc(tq.query)}</div></td>
+      <td class="num">${fmtMs(tq.total_time)}</td>
+    </tr>`).join('') || '<tr><td colspan="4" class="muted">нет данных</td></tr>';
+}
+document.getElementById('hours').addEventListener('change', load);
+load();
+setInterval(load, 60000);
+</script>
+{% endblock %}

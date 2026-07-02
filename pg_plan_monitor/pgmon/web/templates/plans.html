@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Планы запросов</h1>
+<p class="muted">
+  Введите фрагмент текста запроса — покажем последний план и все версии за период.
+  Версия плана сохраняется в момент его изменения, поэтому для любой точки времени
+  видно, какой план действовал.
+</p>
+<div class="filters">
+  <input type="text" id="search" placeholder="фрагмент текста запроса, например: FROM orders WHERE" size="60" autofocus>
+  <label>Версии за:</label>
+  <select id="days">
+    <option value="1">сутки</option>
+    <option value="7" selected>неделю</option>
+    <option value="30">месяц</option>
+    <option value="90">3 месяца</option>
+  </select>
+  <button class="copy" id="go">Найти</button>
+</div>
+
+<div id="results"></div>
+<div class="empty" id="empty" hidden>Ничего не найдено</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function planOption(p, i) {
+  const seq = (p.seq_scan_tables || []).length ? ' · SEQ SCAN!' : '';
+  return `<option value="${p.fingerprint}" ${i === 0 ? 'selected' : ''}>
+    ${fmtTs(String(p.ts))} · ${p.fingerprint} · cost=${Number(p.total_cost).toFixed(0)}${seq}
+  </option>`;
+}
+
+async function search() {
+  const text = document.getElementById('search').value.trim();
+  const days = document.getElementById('days').value;
+  const box = document.getElementById('results');
+  if (!text) { box.innerHTML = ''; return; }
+  const rows = await getJSON(`/api/plans/search?q=${encodeURIComponent(text)}&days=${days}`);
+  document.getElementById('empty').hidden = rows.length > 0;
+
+  box.innerHTML = rows.map((r, ri) => `
+    <div class="card" data-qid="${r.queryid}">
+      <h3><a href="/query/${r.queryid}" class="mono">${r.queryid}</a> · ${esc(r.datname)}
+        · версий плана за период: ${r.plans.length}</h3>
+      <div class="sql full mono">${esc(r.query)}</div>
+      ${r.plans.length ? `
+        <div class="filters">
+          <label>Версия плана:</label>
+          <select class="plan-select" data-ri="${ri}">${r.plans.map(planOption).join('')}</select>
+          <span class="muted plan-note" id="note-${ri}"></span>
+        </div>
+        <pre class="plan" id="plan-${ri}">загрузка…</pre>`
+        : '<div class="muted">планы этого запроса ещё не сняты (появятся после прохода коллектора)</div>'}
+    </div>`).join('');
+
+  window.__hits = rows;
+  document.querySelectorAll('.plan-select').forEach(sel => {
+    sel.addEventListener('change', () => showPlan(Number(sel.dataset.ri)));
+    showPlan(Number(sel.dataset.ri));
+  });
+}
+
+async function showPlan(ri) {
+  const hit = window.__hits[ri];
+  const sel = document.querySelector(`.plan-select[data-ri="${ri}"]`);
+  const fp = sel.value;
+  const idx = hit.plans.findIndex(p => p.fingerprint === fp);
+  const p = hit.plans[idx];
+  // период действия версии: от её ts до ts предыдущей (более новой) версии
+  const until = idx > 0 ? fmtTs(String(hit.plans[idx - 1].ts)) : 'сейчас';
+  document.getElementById(`note-${ri}`).textContent =
+    `действовал: ${fmtTs(String(p.ts))} → ${until} · таблицы: ${(p.tables || []).join(', ') || '—'}` +
+    ((p.seq_scan_tables || []).length ? ` · Seq Scan: ${p.seq_scan_tables.join(', ')}` : '');
+  const d = await getJSON(`/api/query/${hit.queryid}/plan/${fp}`);
+  document.getElementById(`plan-${ri}`).innerHTML = renderPlanText(d.plan);
+}
+
+document.getElementById('go').addEventListener('click', search);
+document.getElementById('search').addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+document.getElementById('days').addEventListener('change', search);
+</script>
+{% endblock %}

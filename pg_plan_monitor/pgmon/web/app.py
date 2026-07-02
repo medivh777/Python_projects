@@ -48,6 +48,21 @@ def queries_page(request: Request):
     return render(request, "queries.html", "Запросы")
 
 
+@app.get("/plans", response_class=HTMLResponse)
+def plans_page(request: Request):
+    return render(request, "plans.html", "Планы")
+
+
+@app.get("/statements", response_class=HTMLResponse)
+def statements_page(request: Request):
+    return render(request, "statements.html", "Statements")
+
+
+@app.get("/tables", response_class=HTMLResponse)
+def tables_page(request: Request):
+    return render(request, "tables.html", "Таблицы")
+
+
 @app.get("/query/{queryid}", response_class=HTMLResponse)
 def query_page(request: Request, queryid: int):
     return render(request, "query_detail.html", f"Запрос {queryid}", queryid=queryid)

@@ -124,6 +124,20 @@ def queries(hours: int = Query(24, ge=1, le=720),
             search: str = "",
             order: str = Query("total_time", pattern="^(total_time|calls|mean_time|max_time|blks_read)$"),
             limit: int = Query(100, ge=1, le=1000)) -> list[dict]:
+    # серверный поиск по телу запроса: сначала находим подходящие queryid
+    search_filter = ""
+    params: dict[str, Any] = {"hours": hours, "limit": limit}
+    if search.strip():
+        found = q("""
+            SELECT DISTINCT queryid FROM queries
+            WHERE positionCaseInsensitive(query, %(s)s) > 0
+            LIMIT 2000
+        """, {"s": search.strip()})
+        if not found:
+            return []
+        search_filter = "AND m.queryid IN %(qids)s"
+        params["qids"] = [r["queryid"] for r in found]
+
     rows = q(f"""
         SELECT m.queryid                                       AS queryid,
                any(m.datname)                                  AS datname,
@@ -136,11 +150,11 @@ def queries(hours: int = Query(24, ge=1, le=720),
                sum(m.shared_blks_read)                         AS blks_read,
                sum(m.temp_blks_written)                        AS temp_blks
         FROM statements_metrics m
-        WHERE m.ts > now() - INTERVAL %(hours)s HOUR
+        WHERE m.ts > now() - INTERVAL %(hours)s HOUR {search_filter}
         GROUP BY m.queryid
         ORDER BY {order} DESC
         LIMIT %(limit)s
-    """, {"hours": hours, "limit": limit})
+    """, params)
 
     if not rows:
         return []
@@ -164,11 +178,8 @@ def queries(hours: int = Query(24, ge=1, le=720),
 
     out = []
     for r in rows:
-        text = text_by_id.get(r["queryid"], "")
-        if search and search.lower() not in text.lower():
-            continue
         p = plan_by_id.get(r["queryid"], {})
-        r["query"] = text
+        r["query"] = text_by_id.get(r["queryid"], "")
         r["plan_count"] = p.get("plan_count", 0)
         r["last_fingerprint"] = p.get("last_fingerprint", "")
         out.append(r)
@@ -299,6 +310,122 @@ def plan_diff(queryid: int, old: str, new: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Поиск планов по телу запроса
+# ---------------------------------------------------------------------------
+
+@router.get("/plans/search")
+def plans_search(text: str = Query("", alias="q"),
+                 days: int = Query(7, ge=1, le=90),
+                 limit: int = Query(20, ge=1, le=100)) -> list[dict]:
+    """Ищет запросы по подстроке текста и возвращает версии их планов
+    за период (последний план — первым). Если в периоде смен не было,
+    возвращается последний известный план запроса."""
+    if not text.strip():
+        return []
+    hits = q("""
+        SELECT qq.queryid AS queryid,
+               argMax(qq.query, qq.last_seen)   AS query,
+               argMax(qq.datname, qq.last_seen) AS datname,
+               max(qq.last_seen)                AS last_seen
+        FROM queries qq
+        WHERE positionCaseInsensitive(qq.query, %(s)s) > 0
+        GROUP BY qq.queryid
+        ORDER BY last_seen DESC
+        LIMIT %(lim)s
+    """, {"s": text.strip(), "lim": limit})
+
+    out = []
+    for h in hits:
+        plans = q("""
+            SELECT ts, fingerprint, total_cost, tables, indexes,
+                   seq_scan_tables, source
+            FROM query_plans
+            WHERE queryid = %(qid)s AND ts > now() - INTERVAL %(days)s DAY
+            ORDER BY ts DESC LIMIT 50
+        """, {"qid": h["queryid"], "days": days})
+        if not plans:
+            # смен плана в периоде не было — показываем последний известный
+            plans = q("""
+                SELECT ts, fingerprint, total_cost, tables, indexes,
+                       seq_scan_tables, source
+                FROM query_plans
+                WHERE queryid = %(qid)s
+                ORDER BY ts DESC LIMIT 1
+            """, {"qid": h["queryid"]})
+        h["plans"] = plans
+        out.append(h)
+    return str_qids(out)
+
+
+# ---------------------------------------------------------------------------
+# Statements: графики как в temboard
+# ---------------------------------------------------------------------------
+
+@router.get("/statements")
+def statements(hours: int = Query(24, ge=1, le=720),
+               top: int = Query(5, ge=1, le=8)) -> dict:
+    step = bucket_minutes(hours)
+
+    series = q(f"""
+        SELECT toStartOfInterval(ts, INTERVAL {step} MINUTE) AS t,
+               sum(calls)                     AS calls,
+               sum(total_exec_time)           AS total_time,
+               total_time / greatest(calls,1) AS mean_time,
+               sum(rows)                      AS rows,
+               sum(shared_blks_read)          AS blks_read,
+               sum(shared_blks_hit)           AS blks_hit,
+               sum(temp_blks_written)         AS temp_blks_written,
+               sum(blk_read_time)             AS blk_read_time,
+               sum(blk_write_time)            AS blk_write_time,
+               sum(wal_bytes)                 AS wal_bytes
+        FROM statements_metrics
+        WHERE ts > now() - INTERVAL %(hours)s HOUR
+        GROUP BY t ORDER BY t
+    """, {"hours": hours})
+
+    top_rows = q("""
+        SELECT queryid, sum(total_exec_time) AS total_time
+        FROM statements_metrics
+        WHERE ts > now() - INTERVAL %(hours)s HOUR
+        GROUP BY queryid ORDER BY total_time DESC LIMIT %(top)s
+    """, {"hours": hours, "top": top})
+    top_ids = [r["queryid"] for r in top_rows]
+
+    per_query: list[dict] = []
+    if top_ids:
+        texts = q("""
+            SELECT queryid, argMax(query, last_seen) AS query
+            FROM queries WHERE queryid IN %(ids)s GROUP BY queryid
+        """, {"ids": top_ids})
+        text_by_id = {t["queryid"]: t["query"] for t in texts}
+
+        buckets = q(f"""
+            SELECT queryid,
+                   toStartOfInterval(ts, INTERVAL {step} MINUTE) AS t,
+                   sum(calls)                     AS calls,
+                   sum(total_exec_time)           AS total_time,
+                   total_time / greatest(calls,1) AS mean_time
+            FROM statements_metrics
+            WHERE ts > now() - INTERVAL %(hours)s HOUR AND queryid IN %(ids)s
+            GROUP BY queryid, t ORDER BY t
+        """, {"hours": hours, "ids": top_ids})
+        by_id: dict = {}
+        for b in buckets:
+            by_id.setdefault(b["queryid"], []).append(
+                {"t": b["t"], "calls": b["calls"],
+                 "total_time": b["total_time"], "mean_time": b["mean_time"]})
+        for r in top_rows:
+            per_query.append({
+                "queryid": str(r["queryid"]),
+                "query": text_by_id.get(r["queryid"], ""),
+                "total_time": r["total_time"],
+                "series": by_id.get(r["queryid"], []),
+            })
+
+    return {"series": series, "top_queries": per_query}
+
+
+# ---------------------------------------------------------------------------
 # Активность (pg_activity / ASH)
 # ---------------------------------------------------------------------------
 
@@ -422,6 +549,70 @@ def recommendations() -> list[dict]:
 # Таблицы
 # ---------------------------------------------------------------------------
 
+@router.get("/tables")
+def tables_list(search: str = "") -> list[dict]:
+    where = ""
+    params: dict[str, Any] = {}
+    if search.strip():
+        where = "AND positionCaseInsensitive(relname, %(s)s) > 0"
+        params["s"] = search.strip()
+    rows = q(f"""
+        SELECT datname, schemaname, relname,
+               argMax(total_bytes, ts)         AS total_bytes,
+               argMax(toast_bytes, ts)         AS toast_bytes,
+               argMax(n_live_tup, ts)          AS n_live_tup,
+               argMax(n_dead_tup, ts)          AS n_dead_tup,
+               argMax(n_mod_since_analyze, ts) AS n_mod_since_analyze,
+               argMax(seq_scan, ts)            AS seq_scan,
+               argMax(idx_scan, ts)            AS idx_scan,
+               argMax(last_vacuum, ts)         AS last_vacuum,
+               argMax(last_autovacuum, ts)     AS last_autovacuum,
+               argMax(last_analyze, ts)        AS last_analyze,
+               argMax(last_autoanalyze, ts)    AS last_autoanalyze,
+               argMax(vacuum_count, ts)        AS vacuum_count,
+               argMax(autovacuum_count, ts)    AS autovacuum_count
+        FROM table_stats
+        WHERE ts > now() - INTERVAL 2 DAY {where}
+        GROUP BY datname, schemaname, relname
+        ORDER BY total_bytes DESC
+        LIMIT 500
+    """, params)
+
+    bloat = q("""
+        SELECT datname, schemaname, relname, kind,
+               argMax(bloat_bytes, ts) AS bloat_bytes,
+               argMax(bloat_pct, ts)   AS bloat_pct,
+               argMax(real_bytes, ts)  AS real_bytes
+        FROM bloat_stats
+        WHERE ts > now() - INTERVAL 2 DAY AND kind = 'table'
+        GROUP BY datname, schemaname, relname, kind
+    """)
+    bloat_by_tbl = {(b["datname"], b["schemaname"], b["relname"]): b for b in bloat}
+
+    idx_bloat = q("""
+        SELECT datname, schemaname, relname,
+               sum(b) AS idx_bloat_bytes
+        FROM (
+            SELECT datname, schemaname, relname, indexrelname,
+                   argMax(bloat_bytes, ts) AS b
+            FROM bloat_stats
+            WHERE ts > now() - INTERVAL 2 DAY AND kind = 'index'
+            GROUP BY datname, schemaname, relname, indexrelname
+        )
+        GROUP BY datname, schemaname, relname
+    """)
+    ib_by_tbl = {(b["datname"], b["schemaname"], b["relname"]): b["idx_bloat_bytes"]
+                 for b in idx_bloat}
+
+    for r in rows:
+        key = (r["datname"], r["schemaname"], r["relname"])
+        b = bloat_by_tbl.get(key, {})
+        r["bloat_bytes"] = b.get("bloat_bytes", 0)
+        r["bloat_pct"] = b.get("bloat_pct", 0)
+        r["idx_bloat_bytes"] = ib_by_tbl.get(key, 0)
+    return rows
+
+
 @router.get("/table/{datname}/{table}")
 def table_detail(datname: str, table: str) -> dict:
     stats = q("""
@@ -430,7 +621,17 @@ def table_detail(datname: str, table: str) -> dict:
                argMax(idx_scan, ts) AS idx_scan,
                argMax(n_live_tup, ts) AS n_live_tup,
                argMax(n_dead_tup, ts) AS n_dead_tup,
-               argMax(total_bytes, ts) AS total_bytes
+               argMax(n_mod_since_analyze, ts) AS n_mod_since_analyze,
+               argMax(total_bytes, ts) AS total_bytes,
+               argMax(toast_bytes, ts) AS toast_bytes,
+               argMax(last_vacuum, ts)      AS last_vacuum,
+               argMax(last_autovacuum, ts)  AS last_autovacuum,
+               argMax(last_analyze, ts)     AS last_analyze,
+               argMax(last_autoanalyze, ts) AS last_autoanalyze,
+               argMax(vacuum_count, ts)     AS vacuum_count,
+               argMax(autovacuum_count, ts) AS autovacuum_count,
+               argMax(analyze_count, ts)    AS analyze_count,
+               argMax(autoanalyze_count, ts) AS autoanalyze_count
         FROM table_stats
         WHERE datname = %(d)s AND relname = %(t)s
         GROUP BY relname, schemaname
@@ -461,5 +662,21 @@ def table_detail(datname: str, table: str) -> dict:
         LIMIT 100
     """, {"d": datname, "t": table})
 
+    bloat = q("""
+        SELECT indexrelname, kind,
+               argMax(bloat_bytes, ts) AS bloat_bytes,
+               argMax(bloat_pct, ts)   AS bloat_pct
+        FROM bloat_stats
+        WHERE datname = %(d)s AND relname = %(t)s
+          AND ts > now() - INTERVAL 2 DAY
+        GROUP BY indexrelname, kind
+    """, {"d": datname, "t": table})
+    table_bloat = next((b for b in bloat if b["kind"] == "table"), {})
+    idx_bloat = {b["indexrelname"]: b for b in bloat if b["kind"] == "index"}
+    for i in indexes:
+        b = idx_bloat.get(i["indexrelname"], {})
+        i["bloat_bytes"] = b.get("bloat_bytes", 0)
+        i["bloat_pct"] = b.get("bloat_pct", 0)
+
     return {"stats": stats[0] if stats else {}, "indexes": indexes,
-            "queries": str_qids(queries_rows)}
+            "table_bloat": table_bloat, "queries": str_qids(queries_rows)}

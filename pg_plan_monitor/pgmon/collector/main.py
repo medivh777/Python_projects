@@ -11,6 +11,7 @@ import time
 from .. import storage
 from ..config import load_config
 from .activity import AshCollector
+from .bloat import BloatCollector
 from .locks import LocksCollector
 from .plans import PlansCollector
 from .recommender import RecommenderCollector
@@ -27,6 +28,7 @@ COLLECTORS = [
     SysstatCollector,
     PlansCollector,
     TableStatsCollector,
+    BloatCollector,
     RecommenderCollector,
 ]
 

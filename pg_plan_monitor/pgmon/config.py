@@ -31,6 +31,7 @@ DEFAULTS: dict[str, Any] = {
         "sysstat": 15,
         "plans": 300,
         "table_stats": 600,
+        "bloat": 3600,
         "recommend": 1800,
     },
     "plans": {

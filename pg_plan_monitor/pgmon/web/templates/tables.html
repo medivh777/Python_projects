@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Таблицы</h1>
+<div class="filters">
+  <input type="text" id="search" placeholder="фильтр по имени таблицы…" size="40">
+  <span class="muted">bloat — оценка по статистике планировщика (ioguix), обновляется раз в час</span>
+</div>
+<table class="data">
+  <thead><tr>
+    <th>БД</th><th>Таблица</th>
+    <th class="num">Размер</th><th class="num">TOAST</th>
+    <th class="num">Bloat таблицы</th><th class="num">Bloat индексов</th>
+    <th class="num">Живых / мёртвых строк</th>
+    <th>Последний vacuum</th><th>Последний analyze</th>
+    <th class="num">Vacuum (руч/авто)</th>
+  </tr></thead>
+  <tbody id="tbody"></tbody>
+</table>
+<div class="empty" id="empty" hidden>Нет данных (коллектор ещё не прошёл)</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const EPOCH_TS = t => !t || String(t).startsWith('1970');
+function vacTs(manual, auto) {
+  const m = EPOCH_TS(manual) ? null : manual, a = EPOCH_TS(auto) ? null : auto;
+  if (!m && !a) return '<span class="sev warning">⚠ никогда</span>';
+  const last = (!m || (a && a > m)) ? {t: a, k: 'auto'} : {t: m, k: 'ручной'};
+  return `${fmtTs(String(last.t))} <span class="muted">(${last.k})</span>`;
+}
+function bloatCell(bytes, pct) {
+  if (!bytes) return '—';
+  const warn = pct >= 30 ? ' <span class="sev warning">⚠</span>' : '';
+  return `${fmtBytes(bytes)} <span class="muted">(${Number(pct).toFixed(0)}%)</span>${warn}`;
+}
+
+async function load() {
+  const search = encodeURIComponent(document.getElementById('search').value);
+  const rows = await getJSON(`/api/tables?search=${search}`);
+  document.getElementById('empty').hidden = rows.length > 0;
+  document.getElementById('tbody').innerHTML = rows.map(r => `
+    <tr>
+      <td>${esc(r.datname)}</td>
+      <td><a href="/table/${encodeURIComponent(r.datname)}/${encodeURIComponent(r.relname)}">${esc(r.schemaname)}.${esc(r.relname)}</a></td>
+      <td class="num">${fmtBytes(r.total_bytes)}</td>
+      <td class="num">${r.toast_bytes ? fmtBytes(r.toast_bytes) : '—'}</td>
+      <td class="num">${bloatCell(r.bloat_bytes, r.bloat_pct)}</td>
+      <td class="num">${r.idx_bloat_bytes ? fmtBytes(r.idx_bloat_bytes) : '—'}</td>
+      <td class="num">${fmtNum(r.n_live_tup)} / ${fmtNum(r.n_dead_tup)}
+        ${Number(r.n_dead_tup) > Number(r.n_live_tup) * 0.2 && Number(r.n_dead_tup) > 1000
+          ? '<span class="sev warning">⚠</span>' : ''}</td>
+      <td>${vacTs(r.last_vacuum, r.last_autovacuum)}</td>
+      <td>${vacTs(r.last_analyze, r.last_autoanalyze)}</td>
+      <td class="num">${fmtNum(r.vacuum_count)} / ${fmtNum(r.autovacuum_count)}</td>
+    </tr>`).join('');
+}
+let t; document.getElementById('search').addEventListener('input', () => { clearTimeout(t); t = setTimeout(load, 400); });
+load();
+setInterval(load, 60000);
+</script>
+{% endblock %}
